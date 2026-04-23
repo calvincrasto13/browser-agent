@@ -1,6 +1,7 @@
-import asyncio, json, logging, os, re, traceback
+import asyncio, base64, json, logging, os, re, traceback
 from datetime import datetime
 from pathlib import Path
+from collections import deque
 
 import ollama
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -8,11 +9,11 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 BASE_DIR  = Path(__file__).parent
 LOGS_DIR  = BASE_DIR / "logs"
 MEM_FILE  = BASE_DIR / "memory" / "user_memory.json"
+DOM_JS    = BASE_DIR / "dom_extract.js"
 LOGS_DIR.mkdir(exist_ok=True)
 
-# ── GPU / performance config (exported for app.py) ───────────────────────────
 GPU_CFG = {
-    "num_gpu":    -1,   # -1 = auto-detect; set to 0 to force CPU-only
+    "num_gpu":    -1,
     "num_thread": os.cpu_count() or 4,
 }
 
@@ -43,17 +44,12 @@ def save_memory(data: dict):
     MEM_FILE.write_text(json.dumps(data, indent=2))
 
 def inject_memory(value: str, memory: dict) -> str:
-    """Replace {{key}} placeholders with memory values."""
     for k, v in memory.items():
         value = value.replace(f"{{{{{k}}}}}", str(v))
     return value
 
 # ── Warmup ────────────────────────────────────────────────────────────────────
 def warmup_model(model: str) -> bool:
-    """
-    Send a minimal ping to Ollama to load the model into memory.
-    Returns True on success, False if Ollama is unreachable or model missing.
-    """
     try:
         agent_log.info(f"Warming up model: {model}")
         ollama.chat(
@@ -61,36 +57,115 @@ def warmup_model(model: str) -> bool:
             messages=[{"role": "user", "content": "ping"}],
             options={**GPU_CFG, "num_predict": 1},
         )
-        agent_log.info(f"Model {model} warmed up successfully.")
+        agent_log.info(f"Model {model} warmed up.")
         return True
     except Exception as e:
         error_log.error(f"warmup_model failed for '{model}': {e}")
         return False
 
-# ── Page info ─────────────────────────────────────────────────────────────────
-async def get_page_info(page) -> dict:
+# ── PHASE 1: Indexed DOM extraction ──────────────────────────────────────────
+_DOM_JS_SRC = None
+
+def _load_dom_js() -> str:
+    global _DOM_JS_SRC
+    if _DOM_JS_SRC is None:
+        if DOM_JS.exists():
+            _DOM_JS_SRC = DOM_JS.read_text()
+        else:
+            _DOM_JS_SRC = """() => {
+  const INTERACTIVE = 'a,button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=menuitem],[role=tab]';
+  const map = {}; const lines = []; let idx = 0;
+  const isVisible = el => {
+    const r = el.getBoundingClientRect();
+    if (r.width===0||r.height===0) return false;
+    const s = window.getComputedStyle(el);
+    return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0';
+  };
+  document.querySelectorAll(INTERACTIVE).forEach(el => {
+    if (!isVisible(el)||idx>=150) return;
+    const tag=el.tagName.toLowerCase();
+    const ph=el.placeholder?` placeholder="${el.placeholder.slice(0,40)}"`:''
+    const href=el.href?` href="${el.href.slice(0,80)}"`:''
+    const aria=el.getAttribute('aria-label')?` aria-label="${el.getAttribute('aria-label').slice(0,60)}"`:''
+    const sel=el.id?'#'+el.id:el.name?'[name="'+el.name+'"]':'';
+    const text=(el.getAttribute('aria-label')||el.placeholder||el.innerText?.trim()||el.value||'').slice(0,80).replace(/\\s+/g,' ');
+    map[idx]={el,selector:sel,tag};
+    lines.push(`[${idx}]<${tag}${ph}${href}${aria}>${text}</${tag}>`);
+    idx++;
+  });
+  window.__AGENT_ELEM_MAP=map;
+  return {elements:lines,count:idx};
+}"""
+    return _DOM_JS_SRC
+
+async def get_page_info(page, capture_screenshot=False) -> dict:
+    """Phase 1: Indexed DOM. Phase 2: optional screenshot for vision models."""
     try:
         url   = page.url
         title = await page.title()
-        text  = (await page.inner_text("body"))[:3000]
-        elems = await page.evaluate("""() => {
-            const sel = 'a,button,input,select,textarea,[role=button],[role=link]';
-            return [...document.querySelectorAll(sel)].slice(0,60).map(el => ({
-                tag:         el.tagName.toLowerCase(),
-                type:        el.type         || '',
-                id:          el.id           || '',
-                name:        el.name         || '',
-                placeholder: el.placeholder  || '',
-                text:        (el.innerText || el.value || el.placeholder || '').trim().slice(0,80),
-                href:        el.href         || '',
-                selector:    el.id ? '#'+el.id : (el.name ? '[name="'+el.name+'"]' : '')
-            }));
-        }""")
-        return {"url": url, "title": title, "text": text, "elements": elems}
+        text  = (await page.inner_text("body"))[:2000]
+
+        dom_result = await page.evaluate(_load_dom_js())
+        elements   = dom_result.get("elements", [])
+
+        info = {
+            "url":        url,
+            "title":      title,
+            "text":       text,
+            "elements":   elements,
+            "elem_count": dom_result.get("count", 0),
+        }
+
+        if capture_screenshot:
+            try:
+                img_bytes = await page.screenshot(type="jpeg", quality=60,
+                                                   full_page=False,
+                                                   clip={"x":0,"y":0,"width":1280,"height":800})
+                info["screenshot_b64"] = base64.b64encode(img_bytes).decode()
+            except Exception as e:
+                agent_log.warning(f"Screenshot capture failed: {e}")
+
+        return info
     except Exception as e:
         return {"url": page.url, "title": "", "text": "", "elements": [], "error": str(e)}
 
-# ── Robust fill helper ────────────────────────────────────────────────────────
+# ── Phase 1: Click / fill by index ───────────────────────────────────────────
+async def click_by_index(page, index: int) -> str:
+    try:
+        result = await page.evaluate("""(idx) => {
+            const entry = window.__AGENT_ELEM_MAP?.[idx];
+            if (!entry) return 'NOT_FOUND';
+            entry.el.click();
+            return entry.selector || entry.tag;
+        }""", index)
+        if result == "NOT_FOUND":
+            raise ValueError(f"Element index {index} not found in map")
+        await page.wait_for_timeout(1000)
+        return f"Clicked element [{index}] ({result})"
+    except Exception as e:
+        raise RuntimeError(f"click_by_index({index}) failed: {e}")
+
+async def fill_by_index(page, index: int, value: str) -> str:
+    try:
+        result = await page.evaluate("""(args) => {
+            const entry = window.__AGENT_ELEM_MAP?.[args.idx];
+            if (!entry) return 'NOT_FOUND';
+            const el = entry.el;
+            el.focus();
+            const niv = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');
+            if (niv) niv.set.call(el, args.value);
+            else el.value = args.value;
+            el.dispatchEvent(new Event('input',  {bubbles:true}));
+            el.dispatchEvent(new Event('change', {bubbles:true}));
+            return entry.selector || entry.tag;
+        }""", {"idx": index, "value": value})
+        if result == "NOT_FOUND":
+            raise ValueError(f"Element index {index} not found in map")
+        return f"Filled element [{index}] with value"
+    except Exception as e:
+        raise RuntimeError(f"fill_by_index({index}) failed: {e}")
+
+# ── Robust fill (fallback) ────────────────────────────────────────────────────
 async def robust_fill(page, selector: str, value: str, timeout: int = 30000):
     try:
         await page.wait_for_selector(selector, state="visible", timeout=timeout)
@@ -98,7 +173,6 @@ async def robust_fill(page, selector: str, value: str, timeout: int = 30000):
         return
     except Exception as e1:
         agent_log.warning(f"fill() failed for {selector}: {e1} — trying click+type")
-
     try:
         loc = page.locator(selector).first
         await loc.wait_for(state="visible", timeout=timeout)
@@ -109,18 +183,15 @@ async def robust_fill(page, selector: str, value: str, timeout: int = 30000):
         return
     except Exception as e2:
         agent_log.warning(f"click+type failed for {selector}: {e2} — trying JS inject")
-
-    await page.evaluate(f"""
-        (function() {{
-            const el = document.querySelector('{selector}');
-            if (!el) return;
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                window.HTMLInputElement.prototype, 'value').set;
-            nativeInputValueSetter.call(el, {json.dumps(value)});
-            el.dispatchEvent(new Event('input',  {{bubbles:true}}));
-            el.dispatchEvent(new Event('change', {{bubbles:true}}));
-        }})();
-    """)
+    await page.evaluate(f"""(function(){{
+        const el=document.querySelector('{selector}');
+        if(!el)return;
+        const niv=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value');
+        if(niv)niv.set.call(el,{json.dumps(value)});
+        else el.value={json.dumps(value)};
+        el.dispatchEvent(new Event('input',{{bubbles:true}}));
+        el.dispatchEvent(new Event('change',{{bubbles:true}}));
+    }})();""")
 
 async def robust_fill_by_label(page, label: str, value: str, timeout: int = 30000):
     try:
@@ -137,61 +208,143 @@ async def robust_fill_by_label(page, label: str, value: str, timeout: int = 3000
     except Exception as e:
         raise RuntimeError(f"Could not fill field labeled '{label}': {e}")
 
-# ── LLM call ──────────────────────────────────────────────────────────────────
+# ── Phase 3: History summarization ───────────────────────────────────────────
+def summarize_history(history: list, model: str, window: int = 6) -> list:
+    """
+    Keep last `window` actions verbatim.
+    Summarize older entries into a single compressed entry.
+    Prevents prompt bloat on long multi-step tasks.
+    """
+    if len(history) <= window:
+        return history
+
+    old    = history[:-window]
+    recent = history[-window:]
+
+    summary_text = "; ".join(
+        f"{h['action'].get('action','?')}\u2192{str(h['result'])[:60]}"
+        for h in old
+    )
+
+    try:
+        resp = ollama.chat(
+            model=model,
+            messages=[{
+                "role": "user",
+                "content": f"Summarize these browser automation steps in \u22642 sentences:\n{summary_text}"
+            }],
+            options={**GPU_CFG, "num_predict": 120},
+        )
+        summary = resp["message"]["content"].strip()
+    except Exception:
+        summary = f"Previously completed {len(old)} steps: {summary_text[:200]}"
+
+    return [{"action": {"action": "summary"}, "result": summary}] + recent
+
+# ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a browser automation agent. Given:
 - A user task
 - The user's memory (credentials, preferences, etc.)
-- The current browser page state (URL, title, visible text, interactive elements)
+- The current browser page state (URL, title, visible text, indexed interactive elements)
 - The history of previous actions taken
 
 Return ONLY a valid JSON array of action objects. No explanation, no markdown fences.
 
-Available actions:
-  {"action":"navigate",         "args":{"url":"https://..."},                          "reason":"..."}
-  {"action":"click",            "args":{"text":"Sign In"},                              "reason":"..."}
-  {"action":"click_sel",        "args":{"selector":"#login-btn"},                       "reason":"..."}
-  {"action":"fill",             "args":{"selector":"#email","value":"{{key}}"},          "reason":"..."}
-  {"action":"fill_label",       "args":{"label":"Email","value":"{{key}}"},              "reason":"..."}
-  {"action":"fill_placeholder", "args":{"placeholder":"Email","value":"{{key}}"},        "reason":"..."}
-  {"action":"press",            "args":{"key":"Enter"},                                  "reason":"..."}
-  {"action":"wait",             "args":{"ms":2000},                                     "reason":"..."}
-  {"action":"wait_selector",    "args":{"selector":"#someEl","timeout":15000},           "reason":"..."}
-  {"action":"scroll",           "args":{"direction":"down","amount":500},                "reason":"..."}
-  {"action":"screenshot",       "args":{},                                               "reason":"..."}
-  {"action":"done",             "args":{"message":"Task completed: ..."},                "reason":"..."}
-  {"action":"error",            "args":{"message":"Cannot complete because: ..."},       "reason":"..."}
+PREFERRED actions (index-based — more reliable):
+  {"action":"click_index",      "args":{"index":3},                                  "reason":"..."}
+  {"action":"fill_index",       "args":{"index":5, "value":"{{key}}"},               "reason":"..."}
+
+FALLBACK actions (use when index not available):
+  {"action":"navigate",         "args":{"url":"https://..."},                        "reason":"..."}
+  {"action":"click",            "args":{"text":"Sign In"},                           "reason":"..."}
+  {"action":"click_sel",        "args":{"selector":"#login-btn"},                    "reason":"..."}
+  {"action":"fill",             "args":{"selector":"#email","value":"{{key}}"},      "reason":"..."}
+  {"action":"fill_label",       "args":{"label":"Email","value":"{{key}}"},          "reason":"..."}
+  {"action":"fill_placeholder", "args":{"placeholder":"Email","value":"{{key}}"},    "reason":"..."}
+  {"action":"press",            "args":{"key":"Enter"},                              "reason":"..."}
+  {"action":"wait",             "args":{"ms":2000},                                  "reason":"..."}
+  {"action":"wait_selector",    "args":{"selector":"#someEl","timeout":15000},       "reason":"..."}
+  {"action":"scroll",           "args":{"direction":"down","amount":500},            "reason":"..."}
+  {"action":"select_option",    "args":{"selector":"#qty","value":"2"},              "reason":"..."}
+  {"action":"screenshot",       "args":{},                                            "reason":"..."}
+  {"action":"new_tab",          "args":{"url":"https://..."},                        "reason":"..."}
+  {"action":"switch_tab",       "args":{"index":0},                                  "reason":"..."}
+  {"action":"close_tab",        "args":{},                                            "reason":"..."}
+  {"action":"done",             "args":{"message":"Task completed: ..."},            "reason":"..."}
+  {"action":"error",            "args":{"message":"Cannot complete because: ..."},   "reason":"..."}
 
 Rules:
-- Use {{key}} placeholders for credentials — the engine replaces them before execution
-- Prefer fill_label or fill_placeholder over fill when selector is uncertain
-- After submitting a form always wait 2000ms before the next action
-- Return 1-5 actions per response; you will be called again with updated page state
-- If the task is clearly done, return a done action
-- If something is impossible, return an error action
+- ALWAYS prefer click_index/fill_index over text/selector matching
+- The elements list shows [N]<tag ...>text</tag> — use the N number for index actions
+- Use {{key}} placeholders for credentials from memory
+- After form submit always wait 2000ms
+- Return 1-5 actions per round; you will be called again with fresh page state
+- If task is done, return done action. If impossible, return error action.
 """
 
-def call_llm(model: str, task: str, memory: dict, page_info: dict, history: list) -> list:
+# ── LLM call (Phase 1: structured JSON, Phase 2: vision) ─────────────────────
+def call_llm(model: str, task: str, memory: dict, page_info: dict,
+             history: list, use_vision: bool = False) -> list:
     safe_mem = {
-        k: ("***" if any(s in k.lower() for s in ["password","pass","pin","secret","card","token","key","ssn","cvv"]) else v)
+        k: ("***" if any(s in k.lower() for s in
+            ["password","pass","pin","secret","card","token","key","ssn","cvv"]) else v)
         for k, v in memory.items()
     }
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": json.dumps({
+
+    page_ctx = {
+        "url":      page_info.get("url"),
+        "title":    page_info.get("title"),
+        "text":     page_info.get("text", "")[:1500],
+        "elements": page_info.get("elements", []),
+    }
+
+    if use_vision and page_info.get("screenshot_b64"):
+        user_content = [
+            {
+                "type": "text",
+                "text": json.dumps({
+                    "task":    task,
+                    "memory":  safe_mem,
+                    "page":    page_ctx,
+                    "history": history,
+                }, indent=2)
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{page_info['screenshot_b64']}"
+                }
+            }
+        ]
+    else:
+        user_content = json.dumps({
             "task":    task,
             "memory":  safe_mem,
-            "page":    page_info,
-            "history": history[-8:]
-        }, indent=2)}
+            "page":    page_ctx,
+            "history": history,
+        }, indent=2)
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": user_content},
     ]
-    resp = ollama.chat(model=model, messages=messages, options=GPU_CFG)
-    raw  = resp["message"]["content"].strip()
-    raw  = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw  = re.sub(r"\s*```$",          "", raw)
-    actions = json.loads(raw)
-    if not isinstance(actions, list):
+
+    resp = ollama.chat(
+        model=model,
+        messages=messages,
+        format="json",
+        options=GPU_CFG,
+    )
+    raw = resp["message"]["content"].strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    parsed = json.loads(raw)
+    if isinstance(parsed, dict):
+        parsed = parsed.get("actions", parsed.get("steps", list(parsed.values())[0]))
+    if not isinstance(parsed, list):
         raise ValueError("LLM did not return a JSON array")
-    return actions
+    return parsed
 
 # ── Action executor ───────────────────────────────────────────────────────────
 NAV_TIMEOUT     = 30_000
@@ -199,7 +352,8 @@ VISIBLE_TIMEOUT = 30_000
 CLICK_TIMEOUT   = 15_000
 FILL_TIMEOUT    = 30_000
 
-async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
+async def execute_action(page, action: dict, memory: dict,
+                         context=None, emit_fn=None) -> str:
     act    = action.get("action", "")
     args   = action.get("args", {})
     reason = action.get("reason", "")
@@ -212,7 +366,38 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
     log(f"ACTION: {act} | args={args} | reason={reason}")
 
     try:
-        if act == "navigate":
+        # ── Phase 1: index-based ──────────────────────────────────────────────
+        if act == "click_index":
+            return await click_by_index(page, int(args["index"]))
+
+        elif act == "fill_index":
+            val = inject_memory(args.get("value", ""), memory)
+            return await fill_by_index(page, int(args["index"]), val)
+
+        # ── Phase 3: multi-tab ────────────────────────────────────────────────
+        elif act == "new_tab":
+            url = args.get("url", "about:blank")
+            new_page = await context.new_page()
+            await new_page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            return f"Opened new tab: {url}"
+
+        elif act == "switch_tab":
+            tab_idx = int(args.get("index", 0))
+            pages = context.pages
+            if tab_idx < len(pages):
+                await pages[tab_idx].bring_to_front()
+                return f"Switched to tab {tab_idx}"
+            return f"Tab {tab_idx} not found (have {len(pages)})"
+
+        elif act == "close_tab":
+            await page.close()
+            pages = context.pages
+            if pages:
+                await pages[-1].bring_to_front()
+            return "Closed current tab"
+
+        # ── Standard actions ──────────────────────────────────────────────────
+        elif act == "navigate":
             url = args["url"]
             await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
             await page.wait_for_timeout(1500)
@@ -252,6 +437,12 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
             await loc.wait_for(state="visible", timeout=FILL_TIMEOUT)
             await loc.fill(val, timeout=FILL_TIMEOUT)
             return f"Filled placeholder '{ph}'"
+
+        elif act == "select_option":
+            sel = args["selector"]
+            val = args.get("value") or args.get("label")
+            await page.select_option(sel, value=val, timeout=FILL_TIMEOUT)
+            return f"Selected option '{val}' in {sel}"
 
         elif act == "press":
             key = args.get("key", "Enter")
@@ -309,8 +500,10 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
         error_log.error(msg)
         return f"FAIL: {msg}"
 
-# ── Main task runner ───────────────────────────────────────────────────────────
-async def run_task(task: str, model: str = "llama3.2", headless: bool = False, emit_fn=None) -> dict:
+# ── Main task runner ──────────────────────────────────────────────────────────
+async def run_task(task: str, model: str = "llama3.2",
+                   headless: bool = False, emit_fn=None,
+                   use_vision: bool = False) -> dict:
     memory  = load_memory()
     history = []
     final   = {"status": "unknown", "message": "", "screenshots": []}
@@ -320,7 +513,7 @@ async def run_task(task: str, model: str = "llama3.2", headless: bool = False, e
         if emit_fn:
             emit_fn("agent_log", {"msg": msg})
 
-    log(f"=== NEW TASK: {task} | model={model} ===")
+    log(f"=== NEW TASK: {task} | model={model} | vision={use_vision} ===")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless, args=["--no-sandbox"])
@@ -335,13 +528,15 @@ async def run_task(task: str, model: str = "llama3.2", headless: bool = False, e
         page = await context.new_page()
         await page.goto("about:blank")
 
-        for round_n in range(1, 13):
-            log(f"--- Round {round_n}/12 ---")
-            page_info = await get_page_info(page)
-            log(f"Page: {page_info['url']} | {page_info['title']}")
+        for round_n in range(1, 16):   # Phase 3: 15 rounds
+            log(f"--- Round {round_n}/15 ---")
+
+            trimmed_history = summarize_history(history, model, window=6)
+            page_info = await get_page_info(page, capture_screenshot=use_vision)
+            log(f"Page: {page_info['url']} | {page_info['title']} | {page_info.get('elem_count',0)} elements indexed")
 
             try:
-                actions = call_llm(model, task, memory, page_info, history)
+                actions = call_llm(model, task, memory, page_info, trimmed_history, use_vision)
             except Exception as e:
                 msg = f"LLM error: {e}"
                 error_log.error(msg)
@@ -351,7 +546,12 @@ async def run_task(task: str, model: str = "llama3.2", headless: bool = False, e
 
             done = False
             for action in actions:
-                result = await execute_action(page, action, memory, emit_fn)
+                result = await execute_action(page, action, memory, context, emit_fn)
+
+                pages = context.pages
+                if pages:
+                    page = pages[-1]
+
                 history.append({"action": action, "result": result})
                 log(f"Result: {result}")
 
@@ -365,7 +565,7 @@ async def run_task(task: str, model: str = "llama3.2", headless: bool = False, e
             if done:
                 break
         else:
-            final = {"status": "timeout", "message": "Max rounds reached without completion"}
+            final = {"status": "timeout", "message": "Max rounds (15) reached without completion"}
             error_log.error(final["message"])
 
         try:
