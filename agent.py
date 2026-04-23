@@ -1,8 +1,16 @@
 """
-BrowserAgent — Uses Ollama (local LLM) to plan and execute browser tasks
-via Playwright. Every action is logged; errors go to logs/errors.log.
+BrowserAgent v2 — Vision-guided browser automation.
+
+Each round:
+  1. Take a screenshot → encode as base64 in RAM
+  2. Send screenshot + context to a vision-capable Ollama model
+  3. LLM returns: observation, reasoning, memory_update, actions
+  4. Execute actions via Playwright
+  5. Discard screenshot — never written to disk
+  6. Update in-RAM working memory
+Only the final screenshot is saved to logs/.
 """
-import asyncio, json, logging, os, re, time
+import asyncio, base64, json, logging, os, re, time
 from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright, Page
@@ -26,7 +34,7 @@ _eh.setLevel(logging.ERROR)
 error_logger.addHandler(_eh)
 
 
-# ── Memory ────────────────────────────────────────────────────────────────────
+# ── Credential memory (persisted) ─────────────────────────────────────────────
 def load_memory() -> dict:
     p = MEMORY_DIR / "user_memory.json"
     return json.loads(p.read_text()) if p.exists() else {}
@@ -37,7 +45,17 @@ def save_memory(data: dict):
 def memory_to_context(mem: dict) -> str:
     if not mem:
         return "No user memory stored yet."
-    return "User memory:\n" + "\n".join(f"  {k}: {v}" for k, v in mem.items())
+    return "User credentials/memory:\n" + "\n".join(
+        f"  {k}: {v}" for k, v in mem.items()
+        if not k.startswith("_")
+    )
+
+
+# ── Screenshot helper — base64 in RAM, never written to disk ──────────────────
+async def screenshot_b64(page: Page) -> str:
+    """Capture a screenshot and return it as a base64 string. Not saved to disk."""
+    png_bytes = await page.screenshot(type="png")
+    return base64.b64encode(png_bytes).decode("utf-8")
 
 
 # ── Action executor ────────────────────────────────────────────────────────────
@@ -71,6 +89,14 @@ async def execute_action(page: Page, action: dict, emit_fn=None) -> str:
                 await page.locator(sel).first.click(timeout=10000)
             await page.wait_for_timeout(800)
             return f"Clicked {text or sel}"
+
+        elif act == "click_coords":
+            x = int(args.get("x", 0))
+            y = int(args.get("y", 0))
+            _emit(f"Clicking at coordinates ({x}, {y})")
+            await page.mouse.click(x, y)
+            await page.wait_for_timeout(800)
+            return f"Clicked at ({x}, {y})"
 
         elif act == "type":
             sel  = args.get("selector", "")
@@ -116,12 +142,6 @@ async def execute_action(page: Page, action: dict, emit_fn=None) -> str:
             await page.evaluate(f"window.scrollBy(0, {dy})")
             return f"Scrolled {direction}"
 
-        elif act == "screenshot":
-            path = str(LOGS_DIR / f"ss_{int(time.time())}.png")
-            await page.screenshot(path=path)
-            _emit(f"Screenshot: {path}")
-            return f"Screenshot: {path}"
-
         elif act == "get_text":
             sel = args.get("selector", "body")
             _emit(f"Getting text from '{sel}'")
@@ -163,111 +183,156 @@ async def execute_action(page: Page, action: dict, emit_fn=None) -> str:
         return f"ERROR: {err}"
 
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are BrowserAgent, an AI that controls a web browser.
+# ── System prompt ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are BrowserAgent, an AI that controls a web browser by visually reading screenshots.
 
-You receive the user task, memory context, and current page state.
-Respond ONLY with a JSON array of browser actions. No prose, no explanation outside JSON.
+Each round you receive:
+  - A screenshot of the current browser state (analyse it carefully)
+  - The user task
+  - User credentials/memory
+  - Your working memory from previous rounds
+  - Results of your last actions
 
-Action schema:
-{ "action": "<name>", "args": { ... }, "reason": "why" }
+Respond ONLY with a single valid JSON object. No prose outside JSON.
+
+Response schema:
+{
+  "observation": "What you see on screen right now",
+  "reasoning":   "Why you are taking the next actions",
+  "memory_update": {
+    "steps_done":    ["list of steps completed so far"],
+    "current_state": "where you are in the task",
+    "blockers":      ["any issues encountered"]
+  },
+  "actions": [
+    { "action": "<name>", "args": { ... }, "reason": "why" }
+  ]
+}
 
 Available actions:
-  navigate           args: { url }
-  click              args: { text } or { selector }
-  type               args: { selector, text, clear:true }
-  fill               args: { selector, value }
-  press              args: { key }
-  wait               args: { ms }
-  wait_for_selector  args: { selector }
-  scroll             args: { direction, amount }
-  screenshot         args: {}
-  get_text           args: { selector }
-  select_option      args: { selector, value }
-  hover              args: { selector }
-  done               args: { message }
-  error              args: { message }
+  navigate          args: { url }
+  click             args: { text } or { selector }
+  click_coords      args: { x, y }   ← use when you can see a button visually but lack a selector
+  type              args: { selector, text, clear:true }
+  fill              args: { selector, value }
+  press             args: { key }
+  wait              args: { ms }
+  wait_for_selector args: { selector }
+  scroll            args: { direction, amount }
+  get_text          args: { selector }
+  select_option     args: { selector, value }
+  hover             args: { selector }
+  done              args: { message }
+  error             args: { message }
 
 CRITICAL RULES:
-- Return ONLY a valid JSON array. No text outside JSON.
-- Use memory for all credentials and personal data (logins, addresses, cards).
-- STOP as soon as the user's goal is visibly achieved - do not keep clicking.
-- If a search result page is shown and the task was "search for X", you are DONE.
-- If a page loads showing the requested content, you are DONE - call done immediately.
-- Do NOT invent extra steps. Do NOT click buttons unrelated to the task.
-- Take a screenshot right before calling done so the user can see the result.
-- Wait 1500ms after every navigation.
-- Prefer text-based click selectors. Use CSS selectors as fallback.
-- If a click fails once, try an alternative selector or skip it - do not retry the same.
-- End every plan with done or error. Never leave a plan open-ended.
+- Always describe what you SEE on the screenshot in "observation" before acting.
+- Use credential memory for all logins — never guess passwords.
+- Prefer click { text } over click { selector } — more robust.
+- Use click_coords when you can clearly see a button on screen but have no selector.
+- STOP and call done as soon as the task goal is visibly achieved.
+- If you see a CAPTCHA or MFA screen, call error immediately — do not attempt to bypass.
+- Never retry the exact same failed action twice in a row.
+- End every response with either done or error in the actions list.
+- Screenshots used for reasoning are discarded after this round — never stored.
 """
 
-async def get_page_info(page: Page) -> dict:
-    try:
-        url   = page.url
-        title = await page.title()
-        text  = await page.evaluate("document.body ? document.body.innerText.slice(0,3000) : ''")
-        html  = await page.evaluate("""() => {
-            const out = [];
-            document.querySelectorAll('form,input,button,select,a,textarea,[role="button"]').forEach(el => {
-                const a = {};
-                for (const attr of el.attributes) a[attr.name] = attr.value;
-                out.push({ tag: el.tagName.toLowerCase(), attrs: a, text: (el.innerText||'').slice(0,60) });
-            });
-            return JSON.stringify(out.slice(0,80), null, 2);
-        }""")
-        return {"url": url, "title": title, "text": text, "html_snippet": html}
-    except:
-        return {"url": "unknown", "title": "unknown", "text": "", "html_snippet": ""}
 
-
-def call_llm(model: str, task: str, memory: dict, page_info: dict,
-             history: list, emit_fn=None) -> list:
-    page_ctx = (
-        f"URL: {page_info['url']}\n"
-        f"Title: {page_info['title']}\n"
-        f"Visible text:\n{page_info['text'][:2500]}\n\n"
-        f"Interactive elements (JSON):\n{page_info['html_snippet'][:2500]}"
-    )
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    msgs += history[-10:]
-    msgs.append({"role": "user", "content": (
-        f"TASK: {task}\n\n"
-        f"MEMORY:\n{memory_to_context(memory)}\n\n"
-        f"PAGE STATE:\n{page_ctx}\n\n"
-        "Return JSON array of next actions."
-    )})
+# ── Vision LLM call ───────────────────────────────────────────────────────────
+def call_vision_llm(
+    model: str,
+    task: str,
+    credential_memory: dict,
+    working_memory: dict,
+    screenshot_b64: str,
+    last_results: list,
+    emit_fn=None,
+) -> dict:
+    """
+    Send screenshot + context to vision LLM.
+    Returns parsed dict with observation / reasoning / memory_update / actions.
+    Screenshot (base64 string) is passed only to this function and not stored.
+    """
+    user_content = [
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+        },
+        {
+            "type": "text",
+            "text": (
+                f"TASK: {task}\n\n"
+                f"CREDENTIALS/MEMORY:\n{memory_to_context(credential_memory)}\n\n"
+                f"WORKING MEMORY (your progress so far):\n"
+                f"{json.dumps(working_memory, indent=2)}\n\n"
+                f"LAST ACTION RESULTS:\n"
+                + ("\n".join(last_results) if last_results else "None yet — first round.") +
+                "\n\nAnalyse the screenshot carefully, then return your JSON response."
+            ),
+        },
+    ]
 
     if emit_fn:
-        emit_fn("log", {"msg": f"Planning next actions with {model}...",
+        emit_fn("log", {"msg": f"👁️  Sending screenshot to {model} for analysis...",
                         "ts": datetime.now().strftime("%H:%M:%S")})
-    resp = ollama.chat(model=model, messages=msgs)
-    raw  = resp["message"]["content"].strip()
 
+    resp = ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_content},
+        ],
+    )
+    raw = resp["message"]["content"].strip()
+
+    # Strip markdown code fences if present
     m = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
     if m:
         raw = m.group(1).strip()
 
     try:
-        actions = json.loads(raw)
-        return [actions] if isinstance(actions, dict) else actions
+        parsed = json.loads(raw)
+        # Ensure actions key exists
+        if "actions" not in parsed:
+            parsed["actions"] = [{"action": "error", "args": {"message": "LLM returned no actions"}}]
+        return parsed
     except Exception as e:
-        error_logger.error(f"JSON parse failed: {e} | raw: {raw[:300]}")
-        return [{"action": "error",
-                 "args": {"message": f"LLM returned invalid JSON: {raw[:200]}"}}]
+        error_logger.error(f"Vision LLM JSON parse failed: {e} | raw: {raw[:300]}")
+        return {
+            "observation":   "Could not parse LLM response.",
+            "reasoning":     "JSON parse error.",
+            "memory_update": {},
+            "actions": [{"action": "error", "args": {"message": f"LLM returned invalid JSON: {raw[:200]}"}}],
+        }
 
 
 # ── Main runner ────────────────────────────────────────────────────────────────
-async def run_task(task: str, model: str = "llama3.2",
-                   headless: bool = False, emit_fn=None) -> dict:
+async def run_task(
+    task: str,
+    model: str = "llama3.2-vision",
+    headless: bool = False,
+    max_rounds: int = 15,
+    emit_fn=None,
+) -> dict:
     def _emit(event, payload):
         if emit_fn:
             emit_fn(event, payload)
 
-    _emit("log", {"msg": f"Task started: {task}", "ts": datetime.now().strftime("%H:%M:%S")})
-    memory  = load_memory()
-    history = []
-    start   = time.time()
+    def _log(msg):
+        logging.info(msg)
+        _emit("log", {"msg": msg, "ts": datetime.now().strftime("%H:%M:%S")})
+
+    _log(f"Task started: {task}")
+    credential_memory = load_memory()
+
+    # In-RAM working memory — tracks agent progress, never written to disk
+    working_memory: dict = {
+        "steps_done":    [],
+        "current_state": "Starting",
+        "blockers":      [],
+    }
+
+    start = time.time()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
@@ -277,25 +342,59 @@ async def run_task(task: str, model: str = "llama3.2",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
-            )
+            ),
         )
         page = await context.new_page()
-        _emit("log", {"msg": "Browser launched (Chromium)", "ts": datetime.now().strftime("%H:%M:%S")})
+        _log("Browser launched (Chromium)")
 
         final_result = "Task incomplete"
-        done = False
+        done         = False
+        last_results: list = []
 
-        for round_num in range(12):
+        for round_num in range(1, max_rounds + 1):
             if done:
                 break
 
-            page_info = await get_page_info(page)
-            actions   = call_llm(model, task, memory, page_info, history, emit_fn=lambda e,p: _emit(e,p))
+            _log(f"── Round {round_num}/{max_rounds} ──")
 
-            round_results = []
-            for action in actions:
-                result = await execute_action(page, action, emit_fn=lambda e,p: _emit(e,p))
-                round_results.append(result)
+            # 1. Screenshot in RAM — base64, never saved here
+            try:
+                ss = await screenshot_b64(page)
+            except Exception as e:
+                _log(f"Screenshot failed: {e}")
+                ss = ""
+
+            # 2. Ask vision LLM
+            llm_resp = call_vision_llm(
+                model=model,
+                task=task,
+                credential_memory=credential_memory,
+                working_memory=working_memory,
+                screenshot_b64=ss,
+                last_results=last_results,
+                emit_fn=emit_fn,
+            )
+
+            # 3. Screenshot reference dropped — GC will reclaim memory
+            del ss
+
+            # 4. Emit vision feed to UI
+            _emit("vision", {
+                "round":       round_num,
+                "observation": llm_resp.get("observation", ""),
+                "reasoning":   llm_resp.get("reasoning",   ""),
+                "memory":      llm_resp.get("memory_update", {}),
+            })
+
+            # 5. Update in-RAM working memory
+            if llm_resp.get("memory_update"):
+                working_memory.update(llm_resp["memory_update"])
+
+            # 6. Execute actions
+            last_results = []
+            for action in llm_resp.get("actions", []):
+                result = await execute_action(page, action, emit_fn=emit_fn)
+                last_results.append(result)
 
                 if result.startswith("DONE:"):
                     final_result = result[5:].strip()
@@ -306,36 +405,31 @@ async def run_task(task: str, model: str = "llama3.2",
                     done = True
                     break
 
-            history.append({"role": "assistant", "content": json.dumps(actions)})
-            history.append({"role": "user",      "content": "Results: " + " | ".join(round_results)})
-
-        # Final screenshot
+        # 7. Save ONE final screenshot to disk
+        ss_name = ""
         try:
             ss_path = str(LOGS_DIR / f"final_{int(time.time())}.png")
             await page.screenshot(path=ss_path)
-            _emit("log", {"msg": f"Final screenshot: {Path(ss_path).name}",
-                          "ts": datetime.now().strftime("%H:%M:%S")})
-        except:
-            ss_path = ""
+            ss_name = Path(ss_path).name
+            _log(f"Final screenshot saved: {ss_name}")
+        except Exception as e:
+            _log(f"Final screenshot failed: {e}")
 
         elapsed = round(time.time() - start, 1)
-        _emit("log", {"msg": f"Task complete in {elapsed}s",
-                      "ts": datetime.now().strftime("%H:%M:%S")})
+        _log(f"Task complete in {elapsed}s")
 
-        # Surface any errors logged
         errors = []
         ef = LOGS_DIR / "errors.log"
         if ef.exists():
             lines = ef.read_text().splitlines()
             errors = [l for l in lines[-20:] if l.strip()]
-            for e in errors:
-                _emit("log", {"msg": e, "ts": datetime.now().strftime("%H:%M:%S")})
 
         await browser.close()
 
         return {
-            "result":     final_result,
-            "elapsed":    elapsed,
-            "screenshot": Path(ss_path).name if ss_path else "",
-            "errors":     errors,
+            "result":         final_result,
+            "elapsed":        elapsed,
+            "screenshot":     ss_name,
+            "errors":         errors,
+            "working_memory": working_memory,
         }

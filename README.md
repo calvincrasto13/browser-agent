@@ -1,157 +1,183 @@
-# BrowserAgent
+# BrowserAgent v2 — Vision-Guided Browser Automation 🤖👁️
 
-Local AI browser automation agent — uses **Ollama** (local LLM) to control a Chromium tab via natural language instructions.
+A local desktop application where a vision-capable LLM **looks at screenshots** of a browser and decides the next action — just like a human would. No cloud APIs. Everything runs on your machine.
 
 ---
 
-## Setup
+## How It Works (Vision Loop)
 
-### 1. Install Ollama
-
-Download and install Ollama from [https://ollama.com/download](https://ollama.com/download).
-
-- **Windows/Mac**: Run the installer — Ollama starts automatically in the background.
-- **Linux**: Run `curl -fsSL https://ollama.com/install.sh | sh` then start it with `ollama serve`.
-
-Verify it is running:
-```bash
-ollama list
+```
+You type a task
+       ↓
+Agent opens Chromium browser
+       ↓
+┌──────────────────────────────────────────┐
+│  Each Round (up to 15 by default):       │
+│                                          │
+│  1. Take screenshot (in-memory, base64)  │
+│  2. Send screenshot + context to LLM    │
+│  3. LLM visually reads the screen        │
+│  4. LLM returns JSON: observation +      │
+│     reasoning + memory_update + actions  │
+│  5. Execute actions (click/fill/press…)  │
+│  6. Discard screenshot — not saved       │
+│  7. Update in-RAM working memory         │
+│  8. Repeat                               │
+└──────────────────────────────────────────┘
+       ↓
+Final screenshot saved to logs/ on completion
 ```
 
 ---
 
-### 2. Pull a Model
+## Memory System
 
-BrowserAgent works best with instruction-following models. Pull one before running the app:
+| Type | Where Stored | Lifetime | Purpose |
+|---|---|---|---|
+| **Credential memory** | `memory/user_memory.json` | Permanent | Your logins, addresses, PII |
+| **Working memory** | RAM only (Python dict) | Task duration only | Agent tracks its progress, state, blockers |
+| **Screenshots** | RAM only (base64) | Seconds — discarded after LLM reads them | Visual input for LLM decision-making |
+| **Final screenshot** | `logs/final_*.png` | Until you delete | Proof of task completion |
+
+**Working memory is never written to disk.** It is a JSON dict held in RAM that the agent updates each round to track what it has done, its current state, and any blockers. It is passed to the LLM each round as context so the agent remembers what it already tried.
+
+---
+
+## Setup (Run Once)
+
+Follow all four steps before launching.
+
+---
+
+### Step 1 — Install Ollama
+
+Download and install Ollama from [https://ollama.com](https://ollama.com).
+
+- **macOS / Linux**: Run the installer, then start Ollama:
+  ```bash
+  ollama serve
+  ```
+- **Windows**: Run the `.exe` installer. Ollama starts automatically in the system tray.
+
+Verify Ollama is running — visit [http://localhost:11434](http://localhost:11434) and you should see `Ollama is running`.
+
+---
+
+### Step 2 — Pull a Vision-Capable Model
+
+This version **requires a model that supports image input**. Pull at least one:
 
 ```bash
-ollama pull llama3.2
+ollama pull llama3.2-vision
 ```
 
-Other recommended options:
+**Recommended vision models:**
 
-| Model | Pull Command | Notes |
+| Model | Command | Notes |
 |---|---|---|
-| **llama3.2** (default) | `ollama pull llama3.2` | Best speed/quality balance |
-| **llama3.1** | `ollama pull llama3.1` | Better for complex multi-step tasks |
-| **mistral** | `ollama pull mistral` | Reliable JSON output |
-| **qwen2.5** | `ollama pull qwen2.5` | Strong structured output |
+| llama3.2-vision ✅ | `ollama pull llama3.2-vision` | Best overall (recommended) |
+| llava:13b | `ollama pull llava:13b` | Higher accuracy, slower |
+| llava | `ollama pull llava` | Lighter, faster |
+| minicpm-v | `ollama pull minicpm-v` | Very fast, lower accuracy |
 
-Verify your model downloaded:
+> ⚠️ Text-only models (llama3.2, mistral, etc.) will **not work** with v2 — they cannot process screenshots.
+
+Confirm the model downloaded:
 ```bash
 ollama list
 ```
 
 ---
 
-### 3. Install Python Dependencies & Chromium
+### Step 3 — Install Python Dependencies & Chromium
+
+From the `browser-agent/` folder:
 
 ```bash
 python setup.py
 ```
 
-This installs all pip packages and downloads the Playwright Chromium browser automatically.
+This installs all packages from `requirements.txt` and downloads Playwright's Chromium browser. Run once only.
 
 ---
 
-### 4. Run the App
+### Step 4 — Run the App
 
 ```bash
 python app.py
 ```
 
-Then open **http://localhost:5000** in your browser.
+Open your browser:
+```
+http://localhost:5000
+```
 
 ---
 
-## Storing Login Credentials
+## Adding Credentials
 
-BrowserAgent uses the Memory system to securely store your usernames, passwords, and other personal info — all saved locally on your PC in `memory/user_memory.json`. The LLM reads these values automatically when it needs to log in to a site.
+Open the **Memory / Credentials** section in the left sidebar and add key/value pairs. The agent substitutes `{{key}}` placeholders with real values at runtime.
 
-### How to Add Credentials via the UI
+**Example keys:**
 
-1. Open **http://localhost:5000**
-2. In the left sidebar, go to the **Memory** tab
-3. Fill in the **Key** and **Value** fields and click **+ Add**
-
-Use a consistent naming pattern so the LLM can recognize them:
-
-| Key | Value (your actual value) |
+| Key | Example Value |
 |---|---|
+| `linkedin_email` | `you@email.com` |
+| `linkedin_password` | `yourpassword` |
 | `walmart_email` | `you@email.com` |
-| `walmart_password` | `yourpassword123` |
-| `amazon_email` | `you@email.com` |
-| `amazon_password` | `yourpassword123` |
-| `gmail_email` | `you@gmail.com` |
-| `gmail_password` | `yourpassword` |
-| `full_name` | `Jane Smith` |
-| `delivery_address` | `123 Main St, Mississauga, ON L5B 2C9` |
-| `phone_number` | `647-555-0123` |
+| `walmart_password` | `yourpassword` |
+| `delivery_address` | `123 Main St, Mississauga, ON` |
+| `full_name` | `Your Name` |
 
-> **Tip:** Name keys as `<sitename>_email` and `<sitename>_password`. The LLM will match them to the right site automatically when you give it a task.
+Keys containing `password`, `pin`, `secret`, `card`, or `token` are **blurred in the UI**. Hover to reveal. All data lives only in `memory/user_memory.json` — never sent anywhere.
 
 ---
 
-### How to Add Credentials Directly (JSON file)
+## Example Tasks
 
-You can also edit `memory/user_memory.json` directly in any text editor:
-
-```json
-{
-  "walmart_email":       "you@email.com",
-  "walmart_password":    "yourpassword",
-  "amazon_email":        "you@email.com",
-  "amazon_password":     "yourpassword",
-  "netflix_email":       "you@email.com",
-  "netflix_password":    "yourpassword",
-  "full_name":           "Jane Smith",
-  "delivery_address":    "123 Main St, Mississauga, ON L5B 2C9",
-  "phone_number":        "647-555-0123"
-}
-```
-
-Save the file — changes take effect on the next task run (no restart needed).
+- *"Login to LinkedIn for me"*
+- *"Go to walmart.ca and reorder my last grocery order"*
+- *"Open Gmail and summarize the 3 most recent unread emails"*
+- *"Search Amazon Canada for mechanical keyboards under $100 and show me the top result"*
+- *"Find the top post on reddit.com/r/programming today"*
 
 ---
 
-### Security Notes
+## UI Panels
 
-- All credentials stay **100% local** — they are never sent anywhere except to your local Ollama instance running on the same machine.
-- In the UI, any key containing `password`, `pin`, `card`, `cvv`, `secret`, or `token` is **blurred** — hover over it to reveal the value.
-- Do **not** commit `memory/user_memory.json` to Git or share it. Add it to `.gitignore`:
-  ```
-  memory/user_memory.json
-  logs/
-  ```
-
----
-
-### Example Tasks Using Stored Credentials
-
-Once your credentials are in memory, you can give natural language tasks like:
-
-```
-Log into my Walmart account and reorder my last grocery order
-```
-
-```
-Sign into Amazon and check my recent orders
-```
-
-```
-Go to Netflix and resume the show I was watching
-```
-
-The agent will automatically look up your stored email and password for that site, fill in the login form, and proceed with the task.
+| Panel | What it shows |
+|---|---|
+| **Agent Log** | Real-time step-by-step actions |
+| **Vision Feed** | What the LLM sees and thinks each round (observation + reasoning + working memory) |
+| **Screenshots** | Final screenshots only (intermediate ones are discarded) |
+| **Errors** | Failed actions with reason |
 
 ---
 
-### Two-Factor Authentication (2FA)
+## Project Structure
 
-If a site uses 2FA (a code sent to your phone or email), the agent will **pause at that step** — it cannot receive the code automatically. When this happens:
+```
+browser-agent/
+├── app.py                  ← Flask + SocketIO server
+├── agent.py                ← Vision LLM planner + Playwright executor
+├── setup.py                ← One-time installer
+├── requirements.txt
+├── README.md
+├── templates/
+│   └── index.html          ← Web UI
+├── memory/
+│   └── user_memory.json    ← Your credentials (local only)
+└── logs/
+    ├── agent.log
+    ├── errors.log
+    └── final_*.png         ← Final screenshots only
+```
 
-1. Watch the browser window that opens on your screen
-2. Manually type the 2FA code into the browser when prompted
-3. The agent will detect the page has moved on and continue automatically
+---
 
-For sites you use frequently with 2FA, consider using an **app password** (Gmail, Outlook) or disabling 2FA on a trusted device to allow unattended automation.
+## Tips
+
+- **Max Rounds** — increase to 25+ for complex multi-page tasks
+- **Headless mode** — faster, but you can't see what's happening
+- **CAPTCHA / MFA** — the agent will report this as a blocker in the Vision Feed; you may need to handle it manually
+- **Model accuracy** — if the agent misreads screens, try `llava:13b` for better visual understanding
