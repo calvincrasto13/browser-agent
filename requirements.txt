@@ -5,3 +5,5 @@ ollama>=0.2
 python-dotenv>=1.0
 pillow>=10.0
 requests>=2.31
+psutil>=5.9
+GPUtil>=1.4

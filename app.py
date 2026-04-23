@@ -1,7 +1,6 @@
 """
-Flask + SocketIO server for BrowserAgent UI.
-Run: python app.py
-Then open http://localhost:5000
+Flask + SocketIO server for BrowserAgent.
+Run: python app.py  →  http://localhost:5000
 """
 import asyncio, json, threading
 from datetime import datetime
@@ -10,7 +9,7 @@ from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from flask_socketio import SocketIO, emit
 
-from agent import run_task, load_memory, save_memory, LOGS_DIR, MEMORY_DIR
+from agent import run_task, load_memory, save_memory, LOGS_DIR, warmup_model, GPU_CFG
 
 app      = Flask(__name__)
 app.secret_key = "browser-agent-secret-2024"
@@ -32,8 +31,7 @@ def get_memory():
 
 @app.route("/api/memory", methods=["POST"])
 def set_memory():
-    data = request.json or {}
-    save_memory(data)
+    save_memory(request.json or {})
     return jsonify({"status": "saved"})
 
 @app.route("/api/memory/entry", methods=["POST"])
@@ -86,11 +84,37 @@ def get_screenshot(name):
 def list_models():
     try:
         import ollama
-        resp = ollama.list()
+        resp   = ollama.list()
         models = [m["name"] for m in resp.get("models", [])]
         return jsonify({"models": models})
     except Exception as e:
         return jsonify({"models": [], "error": str(e)})
+
+
+# ── GPU status API ────────────────────────────────────────────────────────────
+@app.route("/api/gpu")
+def gpu_status():
+    info = dict(GPU_CFG)  # base config from setup
+    try:
+        import GPUtil
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            g = gpus[0]
+            info["vram_used_gb"]  = round(g.memoryUsed  / 1024, 2)
+            info["vram_total_gb"] = round(g.memoryTotal / 1024, 2)
+            info["gpu_load_pct"]  = round(g.load * 100, 1)
+            info["gpu_temp_c"]    = g.temperature
+    except Exception:
+        pass
+    return jsonify(info)
+
+
+# ── Warm-up endpoint ──────────────────────────────────────────────────────────
+@app.route("/api/warmup", methods=["POST"])
+def warmup():
+    model = (request.json or {}).get("model", "llama3.2-vision")
+    threading.Thread(target=warmup_model, args=(model,), daemon=True).start()
+    return jsonify({"status": "warming up", "model": model})
 
 
 # ── SocketIO ──────────────────────────────────────────────────────────────────
@@ -98,7 +122,7 @@ def list_models():
 def handle_run_task(data):
     sid   = request.sid
     task  = data.get("task", "").strip()
-    model = data.get("model", "llama3.2")
+    model = data.get("model", "llama3.2-vision")
 
     if not task:
         emit("error", {"msg": "No task provided."})
@@ -118,8 +142,9 @@ def handle_run_task(data):
                 run_task(task, model=model, headless=False, emit_fn=_emit)
             )
             _emit("task_complete", {
-                "results":    result["results"],
+                "result":     result["result"],
                 "screenshot": result.get("screenshot"),
+                "elapsed":    result.get("elapsed"),
             })
         except Exception as e:
             _emit("task_error", {"msg": str(e)})
@@ -138,7 +163,10 @@ def handle_disconnect():
 
 if __name__ == "__main__":
     print("\n" + "="*52)
-    print("  BrowserAgent is running!")
+    print("  BrowserAgent v3 — GPU + Comet-style control")
+    gpu_label = GPU_CFG.get("gpu_name", "CPU")
+    layers    = GPU_CFG.get("num_gpu_layers", 0)
+    print(f"  GPU: {gpu_label}  |  Layers offloaded: {layers}")
     print("  Open http://localhost:5000")
     print("="*52 + "\n")
     socketio.run(app, host="0.0.0.0", port=5000, debug=False, use_reloader=False)
