@@ -10,7 +10,13 @@ LOGS_DIR  = BASE_DIR / "logs"
 MEM_FILE  = BASE_DIR / "memory" / "user_memory.json"
 LOGS_DIR.mkdir(exist_ok=True)
 
-# ── Loggers ──────────────────────────────────────────────────────────────────
+# ── GPU / performance config (exported for app.py) ───────────────────────────
+GPU_CFG = {
+    "num_gpu":    -1,   # -1 = auto-detect; set to 0 to force CPU-only
+    "num_thread": os.cpu_count() or 4,
+}
+
+# ── Loggers ───────────────────────────────────────────────────────────────────
 def _make_logger(name, file, level=logging.DEBUG):
     log = logging.getLogger(name)
     log.setLevel(level)
@@ -23,7 +29,7 @@ def _make_logger(name, file, level=logging.DEBUG):
 agent_log = _make_logger("agent",  "agent.log")
 error_log = _make_logger("errors", "errors.log", logging.ERROR)
 
-# ── Memory ───────────────────────────────────────────────────────────────────
+# ── Memory ────────────────────────────────────────────────────────────────────
 def load_memory() -> dict:
     if MEM_FILE.exists():
         try:
@@ -42,7 +48,26 @@ def inject_memory(value: str, memory: dict) -> str:
         value = value.replace(f"{{{{{k}}}}}", str(v))
     return value
 
-# ── Page info ────────────────────────────────────────────────────────────────
+# ── Warmup ────────────────────────────────────────────────────────────────────
+def warmup_model(model: str) -> bool:
+    """
+    Send a minimal ping to Ollama to load the model into memory.
+    Returns True on success, False if Ollama is unreachable or model missing.
+    """
+    try:
+        agent_log.info(f"Warming up model: {model}")
+        ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            options={**GPU_CFG, "num_predict": 1},
+        )
+        agent_log.info(f"Model {model} warmed up successfully.")
+        return True
+    except Exception as e:
+        error_log.error(f"warmup_model failed for '{model}': {e}")
+        return False
+
+# ── Page info ─────────────────────────────────────────────────────────────────
 async def get_page_info(page) -> dict:
     try:
         url   = page.url
@@ -67,13 +92,6 @@ async def get_page_info(page) -> dict:
 
 # ── Robust fill helper ────────────────────────────────────────────────────────
 async def robust_fill(page, selector: str, value: str, timeout: int = 30000):
-    """
-    Fill a field reliably without using .clear() which LinkedIn and similar
-    sites block. Tries multiple strategies in order:
-    1. page.fill() directly (no pre-clear needed)
-    2. Click → Ctrl+A → Delete → keyboard.type()
-    3. JS value injection + input/change events (React-compatible)
-    """
     try:
         await page.wait_for_selector(selector, state="visible", timeout=timeout)
         await page.fill(selector, value, timeout=timeout)
@@ -92,7 +110,6 @@ async def robust_fill(page, selector: str, value: str, timeout: int = 30000):
     except Exception as e2:
         agent_log.warning(f"click+type failed for {selector}: {e2} — trying JS inject")
 
-    # Last resort: inject value via JS and fire React-compatible events
     await page.evaluate(f"""
         (function() {{
             const el = document.querySelector('{selector}');
@@ -106,7 +123,6 @@ async def robust_fill(page, selector: str, value: str, timeout: int = 30000):
     """)
 
 async def robust_fill_by_label(page, label: str, value: str, timeout: int = 30000):
-    """Fill by visible label text when no reliable selector is available."""
     try:
         loc = page.get_by_label(label, exact=False).first
         await loc.wait_for(state="visible", timeout=timeout)
@@ -114,7 +130,6 @@ async def robust_fill_by_label(page, label: str, value: str, timeout: int = 3000
         return
     except Exception:
         pass
-    # fallback: by placeholder
     try:
         loc = page.get_by_placeholder(label, exact=False).first
         await loc.wait_for(state="visible", timeout=timeout)
@@ -122,7 +137,7 @@ async def robust_fill_by_label(page, label: str, value: str, timeout: int = 3000
     except Exception as e:
         raise RuntimeError(f"Could not fill field labeled '{label}': {e}")
 
-# ── LLM call ─────────────────────────────────────────────────────────────────
+# ── LLM call ──────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a browser automation agent. Given:
 - A user task
 - The user's memory (credentials, preferences, etc.)
@@ -169,7 +184,7 @@ def call_llm(model: str, task: str, memory: dict, page_info: dict, history: list
             "history": history[-8:]
         }, indent=2)}
     ]
-    resp = ollama.chat(model=model, messages=messages)
+    resp = ollama.chat(model=model, messages=messages, options=GPU_CFG)
     raw  = resp["message"]["content"].strip()
     raw  = re.sub(r"^```(?:json)?\s*", "", raw)
     raw  = re.sub(r"\s*```$",          "", raw)
@@ -179,9 +194,8 @@ def call_llm(model: str, task: str, memory: dict, page_info: dict, history: list
     return actions
 
 # ── Action executor ───────────────────────────────────────────────────────────
-# Generous timeouts for slow-loading sites like LinkedIn
-NAV_TIMEOUT     = 30_000   # page.goto
-VISIBLE_TIMEOUT = 30_000   # wait_for visible
+NAV_TIMEOUT     = 30_000
+VISIBLE_TIMEOUT = 30_000
 CLICK_TIMEOUT   = 15_000
 FILL_TIMEOUT    = 30_000
 
@@ -198,14 +212,12 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
     log(f"ACTION: {act} | args={args} | reason={reason}")
 
     try:
-        # ── navigate ──────────────────────────────────────────────────────────
         if act == "navigate":
             url = args["url"]
             await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
             await page.wait_for_timeout(1500)
             return f"Navigated to {url}"
 
-        # ── click by visible text ─────────────────────────────────────────────
         elif act == "click":
             txt = args["text"]
             loc = page.get_by_text(txt, exact=False).first
@@ -214,7 +226,6 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
             await page.wait_for_timeout(1000)
             return f"Clicked text: {txt}"
 
-        # ── click by CSS selector ─────────────────────────────────────────────
         elif act == "click_sel":
             sel = args["selector"]
             await page.wait_for_selector(sel, state="visible", timeout=VISIBLE_TIMEOUT)
@@ -222,21 +233,18 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
             await page.wait_for_timeout(1000)
             return f"Clicked selector: {sel}"
 
-        # ── fill by CSS selector (robust — no .clear()) ───────────────────────
         elif act == "fill":
             sel = args["selector"]
             val = inject_memory(args.get("value", ""), memory)
             await robust_fill(page, sel, val, timeout=FILL_TIMEOUT)
             return f"Filled {sel}"
 
-        # ── fill by ARIA label ────────────────────────────────────────────────
         elif act == "fill_label":
             label = args["label"]
             val   = inject_memory(args.get("value", ""), memory)
             await robust_fill_by_label(page, label, val, timeout=FILL_TIMEOUT)
             return f"Filled field labeled '{label}'"
 
-        # ── fill by placeholder ───────────────────────────────────────────────
         elif act == "fill_placeholder":
             ph  = args["placeholder"]
             val = inject_memory(args.get("value", ""), memory)
@@ -245,27 +253,23 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
             await loc.fill(val, timeout=FILL_TIMEOUT)
             return f"Filled placeholder '{ph}'"
 
-        # ── keyboard press ────────────────────────────────────────────────────
         elif act == "press":
             key = args.get("key", "Enter")
             await page.keyboard.press(key)
             await page.wait_for_timeout(1000)
             return f"Pressed {key}"
 
-        # ── wait ms ───────────────────────────────────────────────────────────
         elif act == "wait":
             ms = int(args.get("ms", 2000))
             await page.wait_for_timeout(ms)
             return f"Waited {ms}ms"
 
-        # ── wait for selector ─────────────────────────────────────────────────
         elif act == "wait_selector":
             sel = args["selector"]
             t   = int(args.get("timeout", 15000))
             await page.wait_for_selector(sel, state="visible", timeout=t)
             return f"Selector appeared: {sel}"
 
-        # ── scroll ────────────────────────────────────────────────────────────
         elif act == "scroll":
             direction = args.get("direction", "down")
             amount    = int(args.get("amount", 500))
@@ -274,7 +278,6 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
             await page.wait_for_timeout(500)
             return f"Scrolled {direction} {amount}px"
 
-        # ── screenshot ────────────────────────────────────────────────────────
         elif act == "screenshot":
             ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
             path = str(LOGS_DIR / f"screenshot_{ts}.png")
@@ -284,11 +287,9 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
                 emit_fn("screenshot", {"path": os.path.basename(path)})
             return f"Screenshot: {path}"
 
-        # ── done ──────────────────────────────────────────────────────────────
         elif act == "done":
             return "DONE: " + args.get("message", "Task complete")
 
-        # ── error ─────────────────────────────────────────────────────────────
         elif act == "error":
             msg = "ERROR: " + args.get("message", "Unknown error")
             error_log.error(msg)
@@ -308,7 +309,7 @@ async def execute_action(page, action: dict, memory: dict, emit_fn=None) -> str:
         error_log.error(msg)
         return f"FAIL: {msg}"
 
-# ── Main task runner ──────────────────────────────────────────────────────────
+# ── Main task runner ───────────────────────────────────────────────────────────
 async def run_task(task: str, model: str = "llama3.2", headless: bool = False, emit_fn=None) -> dict:
     memory  = load_memory()
     history = []
@@ -367,7 +368,6 @@ async def run_task(task: str, model: str = "llama3.2", headless: bool = False, e
             final = {"status": "timeout", "message": "Max rounds reached without completion"}
             error_log.error(final["message"])
 
-        # final screenshot
         try:
             ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
             spath = str(LOGS_DIR / f"final_{ts}.png")
