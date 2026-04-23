@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Logs & screenshots (don't commit runtime artifacts)
+logs/
+
+# Memory — contains PII/credentials, never commit
+memory/user_memory.json
+
+# OS
+.DS_Store
+Thumbs.db

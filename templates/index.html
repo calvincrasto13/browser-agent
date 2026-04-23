@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BrowserAgent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300..700&family=Geist:wght@300..700&display=swap" rel="stylesheet">
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+:root {
+  --font-body: 'Geist', 'Inter', sans-serif;
+  --font-mono: 'Geist Mono', 'Fira Code', monospace;
+  --text-xs:   clamp(0.75rem,  0.7rem  + 0.2vw, 0.8125rem);
+  --text-sm:   clamp(0.8125rem,0.78rem + 0.2vw, 0.875rem);
+  --text-base: clamp(0.875rem, 0.85rem + 0.2vw, 1rem);
+  --text-lg:   clamp(1rem,     0.95rem + 0.3vw, 1.125rem);
+  --text-xl:   clamp(1.125rem, 1rem    + 0.5vw, 1.375rem);
+  --space-1:0.25rem;--space-2:0.5rem;--space-3:0.75rem;
+  --space-4:1rem;--space-5:1.25rem;--space-6:1.5rem;
+  --space-8:2rem;--space-10:2.5rem;--space-12:3rem;
+  --radius-sm:0.25rem;--radius-md:0.5rem;--radius-lg:0.75rem;--radius-full:9999px;
+  --transition:160ms cubic-bezier(0.16,1,0.3,1);
+}
+[data-theme="dark"] {
+  --bg:#0d0d0f;--surface:#131316;--surface-2:#17171b;--surface-3:#1e1e23;
+  --border:rgba(255,255,255,0.08);--border-strong:rgba(255,255,255,0.14);
+  --text:#e8e8ec;--text-muted:#8888a0;--text-faint:#50505e;
+  --primary:#4f8ef7;--primary-hover:#3a7af0;--primary-dim:rgba(79,142,247,0.12);
+  --success:#3ecf8e;--success-dim:rgba(62,207,142,0.12);
+  --warning:#f5a623;--warning-dim:rgba(245,166,35,0.12);
+  --error:#f46b6b;--error-dim:rgba(244,107,107,0.12);
+  --shadow-sm:0 1px 3px rgba(0,0,0,0.4);--shadow-md:0 4px 16px rgba(0,0,0,0.5);
+  --shadow-lg:0 12px 40px rgba(0,0,0,0.6);
+}
+[data-theme="light"] {
+  --bg:#f4f4f6;--surface:#ffffff;--surface-2:#f8f8fa;--surface-3:#f0f0f3;
+  --border:rgba(0,0,0,0.08);--border-strong:rgba(0,0,0,0.14);
+  --text:#111118;--text-muted:#606070;--text-faint:#a0a0b0;
+  --primary:#2563eb;--primary-hover:#1d4ed8;--primary-dim:rgba(37,99,235,0.1);
+  --success:#16a34a;--success-dim:rgba(22,163,74,0.1);
+  --warning:#d97706;--warning-dim:rgba(217,119,6,0.1);
+  --error:#dc2626;--error-dim:rgba(220,38,38,0.1);
+  --shadow-sm:0 1px 3px rgba(0,0,0,0.08);--shadow-md:0 4px 16px rgba(0,0,0,0.1);
+  --shadow-lg:0 12px 40px rgba(0,0,0,0.15);
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-font-smoothing:antialiased;scroll-behavior:smooth}
+body{font-family:var(--font-body);font-size:var(--text-base);color:var(--text);background:var(--bg);min-height:100dvh;line-height:1.5}
+button{cursor:pointer;border:none;background:none;font:inherit;color:inherit}
+input,textarea,select{font:inherit;color:inherit}
+img{display:block;max-width:100%}
+.app{display:grid;grid-template-columns:260px 1fr;grid-template-rows:52px 1fr;height:100dvh;overflow:hidden}
+.topbar{grid-column:1/-1;display:flex;align-items:center;gap:var(--space-4);padding:0 var(--space-6);background:var(--surface);border-bottom:1px solid var(--border);z-index:10}
+.logo{display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-base);font-weight:600;color:var(--text);text-decoration:none}
+.logo svg{color:var(--primary)}
+.logo-badge{font-size:var(--text-xs);font-weight:500;background:var(--primary-dim);color:var(--primary);padding:2px var(--space-2);border-radius:var(--radius-full)}
+.topbar-actions{margin-left:auto;display:flex;align-items:center;gap:var(--space-3)}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--text-faint);transition:background var(--transition)}
+.status-dot.connected{background:var(--success);box-shadow:0 0 6px var(--success)}
+.status-dot.running{background:var(--warning);animation:pulse 1s ease infinite}
+.status-text{font-size:var(--text-xs);color:var(--text-muted)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.btn-icon{width:32px;height:32px;border-radius:var(--radius-md);display:flex;align-items:center;justify-content:center;color:var(--text-muted);transition:all var(--transition)}
+.btn-icon:hover{background:var(--surface-3);color:var(--text)}
+.sidebar{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.sidebar-tabs{display:flex;border-bottom:1px solid var(--border)}
+.sidebar-tab{flex:1;padding:var(--space-3) var(--space-2);font-size:var(--text-xs);font-weight:500;color:var(--text-muted);text-align:center;border-bottom:2px solid transparent;transition:all var(--transition)}
+.sidebar-tab:hover{color:var(--text)}
+.sidebar-tab.active{color:var(--primary);border-color:var(--primary)}
+.sidebar-panel{flex:1;overflow-y:auto;padding:var(--space-4);display:none}
+.sidebar-panel.active{display:flex;flex-direction:column;gap:var(--space-3)}
+.memory-item{display:flex;align-items:flex-start;gap:var(--space-2);background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-md);padding:var(--space-3)}
+.memory-item-content{flex:1;min-width:0}
+.memory-key{font-size:var(--text-xs);font-weight:600;color:var(--primary);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px}
+.memory-val{font-size:var(--text-xs);color:var(--text-muted);word-break:break-word;font-family:var(--font-mono)}
+.memory-val.sensitive{filter:blur(4px);transition:filter 0.2s}
+.memory-val.sensitive:hover{filter:none}
+.btn-delete{color:var(--text-faint);font-size:14px;padding:2px;border-radius:var(--radius-sm);transition:all var(--transition);flex-shrink:0;line-height:1}
+.btn-delete:hover{color:var(--error);background:var(--error-dim)}
+.add-memory-form{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-md);padding:var(--space-3);display:flex;flex-direction:column;gap:var(--space-2)}
+.add-memory-form label{font-size:var(--text-xs);color:var(--text-muted);font-weight:500}
+.input-sm{background:var(--surface-3);border:1px solid var(--border);border-radius:var(--radius-sm);padding:var(--space-2) var(--space-3);font-size:var(--text-xs);color:var(--text);transition:border-color var(--transition);width:100%}
+.input-sm:focus{outline:none;border-color:var(--primary)}
+.btn-sm{padding:var(--space-2) var(--space-3);border-radius:var(--radius-sm);font-size:var(--text-xs);font-weight:500;transition:all var(--transition)}
+.btn-primary-sm{background:var(--primary);color:#fff}
+.btn-primary-sm:hover{background:var(--primary-hover)}
+.screenshot-grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--space-2)}
+.screenshot-thumb{border-radius:var(--radius-sm);overflow:hidden;border:1px solid var(--border);cursor:pointer;transition:border-color var(--transition);aspect-ratio:16/10;background:var(--surface-3)}
+.screenshot-thumb:hover{border-color:var(--primary)}
+.screenshot-thumb img{width:100%;height:100%;object-fit:cover}
+.main{display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+.task-area{padding:var(--space-5) var(--space-6);background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}
+.task-label{font-size:var(--text-xs);font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:var(--space-2);display:flex;align-items:center;gap:var(--space-2)}
+.task-input-row{display:flex;gap:var(--space-3);align-items:flex-end}
+.task-input{flex:1;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-lg);padding:var(--space-3) var(--space-4);font-size:var(--text-base);color:var(--text);resize:none;min-height:52px;max-height:120px;line-height:1.5;transition:border-color var(--transition)}
+.task-input::placeholder{color:var(--text-faint)}
+.task-input:focus{outline:none;border-color:var(--primary)}
+.task-controls{display:flex;align-items:center;gap:var(--space-3);margin-top:var(--space-3)}
+.model-select{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-md);padding:var(--space-2) var(--space-3);font-size:var(--text-xs);color:var(--text);transition:border-color var(--transition)}
+.model-select:focus{outline:none;border-color:var(--primary)}
+.btn-run{padding:var(--space-2) var(--space-5);background:var(--primary);color:#fff;border-radius:var(--radius-md);font-size:var(--text-sm);font-weight:600;display:flex;align-items:center;gap:var(--space-2);transition:all var(--transition);white-space:nowrap}
+.btn-run:hover{background:var(--primary-hover);transform:translateY(-1px);box-shadow:var(--shadow-md)}
+.btn-run:active{transform:translateY(0)}
+.btn-run:disabled{opacity:0.5;cursor:not-allowed;transform:none}
+.btn-stop{padding:var(--space-2) var(--space-4);background:var(--error-dim);color:var(--error);border:1px solid rgba(244,107,107,0.2);border-radius:var(--radius-md);font-size:var(--text-sm);font-weight:600;display:none;align-items:center;gap:var(--space-2);transition:all var(--transition)}
+.btn-stop.visible{display:flex}
+.btn-stop:hover{background:var(--error);color:#fff}
+.example-tasks{display:flex;flex-wrap:wrap;gap:var(--space-2);margin-top:var(--space-3)}
+.example-chip{font-size:var(--text-xs);color:var(--text-muted);background:var(--surface-3);border:1px solid var(--border);border-radius:var(--radius-full);padding:3px var(--space-3);cursor:pointer;transition:all var(--transition)}
+.example-chip:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-dim)}
+.log-area{flex:1;overflow-y:auto;padding:var(--space-4) var(--space-6);display:flex;flex-direction:column;gap:var(--space-2)}
+.log-entry{display:flex;gap:var(--space-3);align-items:flex-start;padding:var(--space-3) var(--space-4);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);animation:slideIn 0.2s ease}
+@keyframes slideIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.log-ts{font-size:var(--text-xs);color:var(--text-faint);font-family:var(--font-mono);white-space:nowrap;flex-shrink:0;padding-top:1px}
+.log-msg{font-size:var(--text-sm);color:var(--text-muted);flex:1;font-family:var(--font-mono);word-break:break-word;line-height:1.5}
+.log-entry.log-done{border-color:rgba(62,207,142,0.2);background:var(--success-dim)}
+.log-entry.log-done .log-msg{color:var(--success)}
+.log-entry.log-error{border-color:rgba(244,107,107,0.2);background:var(--error-dim)}
+.log-entry.log-error .log-msg{color:var(--error)}
+.log-entry.log-plan{border-color:rgba(79,142,247,0.2)}
+.log-entry.log-plan .log-msg{color:var(--primary)}
+.log-entry.log-system{background:var(--surface-2)}
+.log-entry.log-system .log-msg{color:var(--text-faint);font-style:italic}
+.empty-log{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--text-faint);gap:var(--space-3);text-align:center;padding:var(--space-10)}
+.empty-log svg{opacity:0.3}
+.empty-log p{font-size:var(--text-sm);max-width:32ch}
+.statusbar{display:flex;align-items:center;justify-content:space-between;padding:var(--space-2) var(--space-6);border-top:1px solid var(--border);background:var(--surface);flex-shrink:0}
+.statusbar-left{display:flex;align-items:center;gap:var(--space-3)}
+.statusbar-right{display:flex;align-items:center;gap:var(--space-3)}
+.stat-chip{font-size:var(--text-xs);color:var(--text-faint);font-family:var(--font-mono)}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.8);display:flex;align-items:center;justify-content:center;z-index:100;opacity:0;pointer-events:none;transition:opacity 0.2s}
+.modal-overlay.open{opacity:1;pointer-events:all}
+.modal-box{background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);max-width:90vw;max-height:85vh;overflow:hidden;display:flex;flex-direction:column;transform:scale(0.96);transition:transform 0.2s}
+.modal-overlay.open .modal-box{transform:scale(1)}
+.modal-header{display:flex;align-items:center;justify-content:space-between;padding:var(--space-3) var(--space-5);border-bottom:1px solid var(--border)}
+.modal-title{font-size:var(--text-sm);font-weight:600}
+.modal-body{overflow:auto;padding:var(--space-4)}
+.modal-body img{border-radius:var(--radius-md);max-width:100%}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--text-faint)}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <a href="/" class="logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/><path d="M2 12h5M17 12h5M12 2v5M12 17v5"/>
+        <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/>
+      </svg>
+      BrowserAgent
+      <span class="logo-badge">local LLM</span>
+    </a>
+    <div class="topbar-actions">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-text" id="statusText">Connecting…</span>
+      <button class="btn-icon" id="themeToggle" title="Toggle theme">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+  <aside class="sidebar">
+    <div class="sidebar-tabs">
+      <button class="sidebar-tab active" data-panel="memory">Memory</button>
+      <button class="sidebar-tab" data-panel="screenshots">Shots</button>
+      <button class="sidebar-tab" data-panel="errlog">Errors</button>
+    </div>
+    <div class="sidebar-panel active" id="panel-memory">
+      <div class="add-memory-form">
+        <label>Add to memory</label>
+        <input class="input-sm" id="memKey" placeholder="Key (e.g. walmart_email)" />
+        <input class="input-sm" id="memVal" placeholder="Value" type="text" />
+        <button class="btn-sm btn-primary-sm" onclick="addMemory()">+ Add</button>
+      </div>
+      <div id="memoryList"></div>
+    </div>
+    <div class="sidebar-panel" id="panel-screenshots">
+      <button class="btn-sm btn-primary-sm" onclick="loadScreenshots()" style="width:100%">↻ Refresh</button>
+      <div class="screenshot-grid" id="screenshotGrid"></div>
+    </div>
+    <div class="sidebar-panel" id="panel-errlog">
+      <button class="btn-sm" style="background:var(--error-dim);color:var(--error);width:100%" onclick="clearLogs()">Clear Logs</button>
+      <pre id="errorLogContent" style="font-size:var(--text-xs);font-family:var(--font-mono);color:var(--text-muted);white-space:pre-wrap;line-height:1.6"></pre>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="task-area">
+      <div class="task-label">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="4"/></svg>
+        Instruction
+      </div>
+      <div class="task-input-row">
+        <textarea class="task-input" id="taskInput" rows="2"
+          placeholder="Tell the agent what to do… e.g. 'Go to walmart.ca and reorder my last grocery order'"
+        ></textarea>
+      </div>
+      <div class="task-controls">
+        <select class="model-select" id="modelSelect">
+          <option value="llama3.2">llama3.2</option>
+          <option value="llama3.1">llama3.1</option>
+          <option value="mistral">mistral</option>
+          <option value="gemma2">gemma2</option>
+          <option value="qwen2.5">qwen2.5</option>
+        </select>
+        <button class="btn-run" id="btnRun" onclick="runTask()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+          Run Task
+        </button>
+        <button class="btn-stop" id="btnStop" onclick="stopTask()">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+          Stop
+        </button>
+        <span class="stat-chip" id="taskTimer" style="margin-left:auto"></span>
+      </div>
+      <div class="example-tasks">
+        <span class="example-chip" onclick="setExample(this)">Go to walmart.ca and search for pasta</span>
+        <span class="example-chip" onclick="setExample(this)">Open google.com and search for weather in Toronto</span>
+        <span class="example-chip" onclick="setExample(this)">Go to reddit.com and find the top post in r/programming</span>
+        <span class="example-chip" onclick="setExample(this)">Search Amazon Canada for a mechanical keyboard under $100</span>
+      </div>
+    </div>
+    <div class="log-area" id="logArea">
+      <div class="empty-log" id="emptyLog">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/>
+        </svg>
+        <p>Agent activity will appear here once you run a task.</p>
+      </div>
+    </div>
+    <div class="statusbar">
+      <div class="statusbar-left"><span class="stat-chip" id="logCount">0 events</span></div>
+      <div class="statusbar-right">
+        <span class="stat-chip" id="currentModel">Model: —</span>
+        <button class="btn-sm" style="font-size:var(--text-xs);color:var(--text-faint)" onclick="clearUI()">Clear UI</button>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="modal-overlay" id="modal" onclick="closeModal(event)">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span class="modal-title" id="modalTitle">Screenshot</span>
+      <button class="btn-icon" onclick="closeModal()">&#x2715;</button>
+    </div>
+    <div class="modal-body"><img id="modalImg" src="" alt="Screenshot"></div>
+  </div>
+</div>
+<script>
+const socket=io();let running=false,timerInterval=null,startTime=null,logCount=0;
+socket.on("connect",()=>{setStatus("connected","Connected");loadMemory();loadModels();});
+socket.on("disconnect",()=>setStatus("disconnected","Disconnected"));
+socket.on("log",d=>addLog(d.msg,d.ts,classifyLog(d.msg)));
+socket.on("task_complete",d=>onTaskComplete(d));
+socket.on("task_error",d=>onTaskError(d));
+function setStatus(s,t){const dot=document.getElementById("statusDot"),lb=document.getElementById("statusText");dot.className="status-dot "+(s==="connected"?"connected":s==="running"?"running":"");lb.textContent=t;}
+function setRunning(v){running=v;document.getElementById("btnRun").disabled=v;document.getElementById("btnStop").className="btn-stop"+(v?" visible":"");if(v){setStatus("running","Running\u2026");startTime=Date.now();timerInterval=setInterval(()=>{document.getElementById("taskTimer").textContent=((Date.now()-startTime)/1000).toFixed(1)+"s";},100);}else{setStatus("connected","Connected");clearInterval(timerInterval);}}
+function runTask(){const task=document.getElementById("taskInput").value.trim(),model=document.getElementById("modelSelect").value;if(!task){document.getElementById("taskInput").focus();return;}clearUI(false);setRunning(true);document.getElementById("currentModel").textContent="Model: "+model;addLog("Task started: "+task,now(),"log-system");socket.emit("run_task",{task,model});}
+function stopTask(){addLog("Stop requested.",now(),"log-error");setRunning(false);}
+function onTaskComplete(d){setRunning(false);const elapsed=((Date.now()-startTime)/1000).toFixed(1);addLog("Task complete in "+elapsed+"s",now(),"log-done");if(d.results){const last=d.results[d.results.length-1]||"";if(last.startsWith("DONE:"))addLog(last,now(),"log-done");else if(last.startsWith("ERROR:"))addLog(last,now(),"log-error");}if(d.screenshot){const name=d.screenshot.split(/[\\/]/).pop();addLog("Final screenshot: "+name,now(),"log-system");}loadScreenshots();}
+function onTaskError(d){setRunning(false);addLog("Agent error: "+d.msg,now(),"log-error");}
+function classifyLog(m){if(m.includes("DONE:")||m.includes("complete"))return"log-done";if(m.includes("ERROR:")||m.includes("failed"))return"log-error";if(m.includes("Planning")||m.includes("Planning"))return"log-plan";return"";}
+function addLog(msg,ts,cls=""){const area=document.getElementById("logArea");document.getElementById("emptyLog").style.display="none";logCount++;document.getElementById("logCount").textContent=logCount+" event"+(logCount===1?"":"s");const el=document.createElement("div");el.className="log-entry "+cls;el.innerHTML=`<span class="log-ts">${ts}</span><span class="log-msg">${escHtml(msg)}</span>`;area.appendChild(el);area.scrollTop=area.scrollHeight;}
+function now(){return new Date().toLocaleTimeString("en-CA",{hour12:false});}
+function clearUI(ri=true){const area=document.getElementById("logArea");area.innerHTML='<div class="empty-log" id="emptyLog"><svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg><p>Agent activity will appear here once you run a task.</p></div>';logCount=0;document.getElementById("logCount").textContent="0 events";document.getElementById("taskTimer").textContent="";if(ri)document.getElementById("taskInput").value="";}
+function escHtml(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+async function loadMemory(){const r=await fetch("/api/memory"),m=await r.json();renderMemory(m);}
+function renderMemory(mem){const list=document.getElementById("memoryList");list.innerHTML="";const S=["password","pass","pin","ssn","card","cvv","secret","token","key"];for(const[k,v]of Object.entries(mem)){const iS=S.some(s=>k.toLowerCase().includes(s));list.innerHTML+=`<div class="memory-item"><div class="memory-item-content"><div class="memory-key">${escHtml(k)}</div><div class="memory-val ${iS?"sensitive":""}">${escHtml(v)}</div></div><button class="btn-delete" onclick="deleteMemory('${escHtml(k)}')">&#x2715;</button></div>`;}if(!Object.keys(mem).length)list.innerHTML='<p style="font-size:var(--text-xs);color:var(--text-faint);text-align:center;padding:var(--space-4)">No memory stored yet.</p>';}
+async function addMemory(){const key=document.getElementById("memKey").value.trim(),val=document.getElementById("memVal").value.trim();if(!key||!val)return;const r=await fetch("/api/memory/entry",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key,value:val})});const d=await r.json();renderMemory(d.memory);document.getElementById("memKey").value="";document.getElementById("memVal").value="";}
+async function deleteMemory(key){const r=await fetch(`/api/memory/entry/${encodeURIComponent(key)}`,{method:"DELETE"});const d=await r.json();renderMemory(d.memory);}
+async function loadModels(){const r=await fetch("/api/models");const d=await r.json();if(d.models&&d.models.length){const sel=document.getElementById("modelSelect");sel.innerHTML=d.models.map(m=>`<option value="${m}">${m}</option>`).join("");}}
+async function loadScreenshots(){const r=await fetch("/api/screenshots");const names=await r.json();const grid=document.getElementById("screenshotGrid");grid.innerHTML=names.map(n=>`<div class="screenshot-thumb" onclick="openModal('/api/screenshots/${n}','${n}')"><img src="/api/screenshots/${n}" alt="${n}" loading="lazy"></div>`).join("");}
+function openModal(src,title){document.getElementById("modalImg").src=src;document.getElementById("modalTitle").textContent=title;document.getElementById("modal").classList.add("open");}
+function closeModal(e){if(!e||e.target===document.getElementById("modal")||e.currentTarget===document.querySelector(".btn-icon"))document.getElementById("modal").classList.remove("open");}
+async function loadErrors(){const r=await fetch("/api/logs");const d=await r.json();document.getElementById("errorLogContent").textContent=d.errors.length?d.errors.join("\n"):"No errors logged.";}
+async function clearLogs(){await fetch("/api/logs/clear",{method:"POST"});document.getElementById("errorLogContent").textContent="Logs cleared.";}
+document.querySelectorAll(".sidebar-tab").forEach(tab=>{tab.addEventListener("click",()=>{document.querySelectorAll(".sidebar-tab").forEach(t=>t.classList.remove("active"));document.querySelectorAll(".sidebar-panel").forEach(p=>p.classList.remove("active"));tab.classList.add("active");document.getElementById("panel-"+tab.dataset.panel).classList.add("active");if(tab.dataset.panel==="screenshots")loadScreenshots();if(tab.dataset.panel==="errlog")loadErrors();});});
+const themeBtn=document.getElementById("themeToggle");themeBtn.addEventListener("click",()=>{const html=document.documentElement;const next=html.dataset.theme==="dark"?"light":"dark";html.dataset.theme=next;});
+function setExample(el){document.getElementById("taskInput").value=el.textContent;document.getElementById("taskInput").focus();}
+document.getElementById("taskInput").addEventListener("keydown",e=>{if(e.key==="Enter"&&(e.ctrlKey||e.metaKey)){e.preventDefault();runTask();}});
+</script>
+</body>
+</html>

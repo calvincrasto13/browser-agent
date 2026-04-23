@@ -1,0 +1,7 @@
+flask>=3.0
+flask-socketio>=5.3
+playwright>=1.44
+ollama>=0.2
+python-dotenv>=1.0
+pillow>=10.0
+requests>=2.31

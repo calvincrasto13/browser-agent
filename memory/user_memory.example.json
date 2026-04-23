@@ -1,0 +1,10 @@
+{
+  "_note": "Copy this file to user_memory.json and fill in your details. This example file is safe to commit — user_memory.json is gitignored.",
+  "walmart_email": "your@email.com",
+  "walmart_password": "your_password_here",
+  "amazon_email": "your@email.com",
+  "amazon_password": "your_password_here",
+  "delivery_address": "123 Main St, City, Province, Postal Code",
+  "full_name": "Your Full Name",
+  "phone_number": "647-000-0000"
+}
