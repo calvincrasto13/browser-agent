@@ -10,10 +10,10 @@ Each round:
   6. Update in-RAM working memory
 Only the final screenshot is saved to logs/.
 """
-import asyncio, base64, json, logging, os, re, time
+import asyncio, base64, json, logging, re, time
 from datetime import datetime
 from pathlib import Path
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright, Page, Frame
 import ollama
 
 BASE_DIR   = Path(__file__).parent
@@ -53,9 +53,94 @@ def memory_to_context(mem: dict) -> str:
 
 # ── Screenshot helper — base64 in RAM, never written to disk ──────────────────
 async def screenshot_b64(page: Page) -> str:
-    """Capture a screenshot and return it as a base64 string. Not saved to disk."""
     png_bytes = await page.screenshot(type="png")
     return base64.b64encode(png_bytes).decode("utf-8")
+
+
+# ── Robust click: 5-strategy fallback chain ─────────────────────────────────────
+async def robust_click_text(page: Page, text: str, log_fn=None) -> str:
+    """
+    Try clicking an element matching `text` using 5 escalating strategies.
+    Handles shadow DOM, cross-frame buttons (e.g. 'Continue with Google' on LinkedIn).
+    Returns a result string. Raises only if all strategies fail.
+    """
+    tried = []
+
+    # Strategy 1: Standard get_by_text
+    try:
+        tried.append("get_by_text")
+        await page.get_by_text(text, exact=False).first.click(timeout=5000)
+        return f"Clicked (get_by_text): {text}"
+    except Exception:
+        pass
+
+    # Strategy 2: Semantic role — button or link with matching name
+    for role in ("button", "link"):
+        try:
+            tried.append(f"get_by_role({role})")
+            await page.get_by_role(role, name=re.compile(text, re.IGNORECASE)).first.click(timeout=5000)
+            return f"Clicked (get_by_role {role}): {text}"
+        except Exception:
+            pass
+
+    # Strategy 3: ARIA label CSS attribute selector
+    try:
+        tried.append("aria-label selector")
+        sel = f'[aria-label*="{text}" i]'
+        await page.locator(sel).first.click(timeout=5000)
+        return f"Clicked (aria-label): {text}"
+    except Exception:
+        pass
+
+    # Strategy 4: Search all frames (iframes) for the text and click there
+    try:
+        tried.append("cross-frame JS")
+        result = await _click_in_all_frames(page, text)
+        if result:
+            return f"Clicked (frame JS): {text}"
+    except Exception:
+        pass
+
+    # Strategy 5: XPath innerText across main frame
+    try:
+        tried.append("XPath innerText")
+        xpath = f'//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "{text.lower()}")]'
+        await page.locator(f"xpath={xpath}").first.click(timeout=5000)
+        return f"Clicked (XPath): {text}"
+    except Exception:
+        pass
+
+    raise RuntimeError(f"All click strategies failed for '{text}'. Tried: {tried}")
+
+
+async def _click_in_all_frames(page: Page, text: str) -> bool:
+    """
+    Walk every frame on the page (including nested iframes) and click
+    the first element whose visible text matches. Handles LinkedIn-style
+    social login buttons embedded inside cross-origin iframes.
+    """
+    frames = page.frames
+    text_lower = text.lower()
+    for frame in frames:
+        try:
+            clicked = await frame.evaluate(
+                """(textLower) => {
+                    const els = document.querySelectorAll('button, a, [role="button"], [role="link"], div, span');
+                    for (const el of els) {
+                        if ((el.innerText || el.textContent || '').toLowerCase().includes(textLower)) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                text_lower,
+            )
+            if clicked:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 # ── Action executor ────────────────────────────────────────────────────────────
@@ -82,13 +167,15 @@ async def execute_action(page: Page, action: dict, emit_fn=None) -> str:
             sel  = args.get("selector", "")
             text = args.get("text", "")
             if text:
-                _emit(f"Clicking element with text '{text}'")
-                await page.get_by_text(text, exact=False).first.click(timeout=10000)
+                _emit(f"Clicking element with text '{text}' (robust fallback chain)")
+                result = await robust_click_text(page, text, log_fn=_emit)
+                await page.wait_for_timeout(800)
+                return result
             else:
                 _emit(f"Clicking selector '{sel}'")
                 await page.locator(sel).first.click(timeout=10000)
-            await page.wait_for_timeout(800)
-            return f"Clicked {text or sel}"
+                await page.wait_for_timeout(800)
+                return f"Clicked {sel}"
 
         elif act == "click_coords":
             x = int(args.get("x", 0))
@@ -211,8 +298,8 @@ Response schema:
 
 Available actions:
   navigate          args: { url }
-  click             args: { text } or { selector }
-  click_coords      args: { x, y }   ← use when you can see a button visually but lack a selector
+  click             args: { text } or { selector }   ← automatically tries 5 fallback strategies including iframe/shadow DOM
+  click_coords      args: { x, y }                  ← use pixel coords when you can see the button visually
   type              args: { selector, text, clear:true }
   fill              args: { selector, value }
   press             args: { key }
@@ -228,11 +315,11 @@ Available actions:
 CRITICAL RULES:
 - Always describe what you SEE on the screenshot in "observation" before acting.
 - Use credential memory for all logins — never guess passwords.
-- Prefer click { text } over click { selector } — more robust.
-- Use click_coords when you can clearly see a button on screen but have no selector.
+- click { text } automatically tries get_by_text, get_by_role, aria-label, iframe search, and XPath — prefer it.
+- If click { text } fails AND you can see the button on screen, immediately follow up with click_coords { x, y }.
 - STOP and call done as soon as the task goal is visibly achieved.
 - If you see a CAPTCHA or MFA screen, call error immediately — do not attempt to bypass.
-- Never retry the exact same failed action twice in a row.
+- Never retry the exact same failed action twice in a row — switch strategy.
 - End every response with either done or error in the actions list.
 - Screenshots used for reasoning are discarded after this round — never stored.
 """
@@ -248,11 +335,6 @@ def call_vision_llm(
     last_results: list,
     emit_fn=None,
 ) -> dict:
-    """
-    Send screenshot + context to vision LLM.
-    Returns parsed dict with observation / reasoning / memory_update / actions.
-    Screenshot (base64 string) is passed only to this function and not stored.
-    """
     user_content = [
         {
             "type": "image_url",
@@ -285,14 +367,12 @@ def call_vision_llm(
     )
     raw = resp["message"]["content"].strip()
 
-    # Strip markdown code fences if present
     m = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
     if m:
         raw = m.group(1).strip()
 
     try:
         parsed = json.loads(raw)
-        # Ensure actions key exists
         if "actions" not in parsed:
             parsed["actions"] = [{"action": "error", "args": {"message": "LLM returned no actions"}}]
         return parsed
@@ -325,7 +405,6 @@ async def run_task(
     _log(f"Task started: {task}")
     credential_memory = load_memory()
 
-    # In-RAM working memory — tracks agent progress, never written to disk
     working_memory: dict = {
         "steps_done":    [],
         "current_state": "Starting",
@@ -357,14 +436,12 @@ async def run_task(
 
             _log(f"── Round {round_num}/{max_rounds} ──")
 
-            # 1. Screenshot in RAM — base64, never saved here
             try:
                 ss = await screenshot_b64(page)
             except Exception as e:
                 _log(f"Screenshot failed: {e}")
                 ss = ""
 
-            # 2. Ask vision LLM
             llm_resp = call_vision_llm(
                 model=model,
                 task=task,
@@ -375,10 +452,8 @@ async def run_task(
                 emit_fn=emit_fn,
             )
 
-            # 3. Screenshot reference dropped — GC will reclaim memory
-            del ss
+            del ss  # discard — GC reclaims RAM
 
-            # 4. Emit vision feed to UI
             _emit("vision", {
                 "round":       round_num,
                 "observation": llm_resp.get("observation", ""),
@@ -386,11 +461,9 @@ async def run_task(
                 "memory":      llm_resp.get("memory_update", {}),
             })
 
-            # 5. Update in-RAM working memory
             if llm_resp.get("memory_update"):
                 working_memory.update(llm_resp["memory_update"])
 
-            # 6. Execute actions
             last_results = []
             for action in llm_resp.get("actions", []):
                 result = await execute_action(page, action, emit_fn=emit_fn)
@@ -405,7 +478,7 @@ async def run_task(
                     done = True
                     break
 
-        # 7. Save ONE final screenshot to disk
+        # Save ONE final screenshot to disk
         ss_name = ""
         try:
             ss_path = str(LOGS_DIR / f"final_{int(time.time())}.png")
