@@ -2,7 +2,7 @@
 BrowserAgent — Uses Ollama (local LLM) to plan and execute browser tasks
 via Playwright. Every action is logged; errors go to logs/errors.log.
 """
-import asyncio, json, logging, re, time
+import asyncio, json, logging, os, re, time
 from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright, Page
@@ -188,13 +188,18 @@ Available actions:
   done               args: { message }
   error              args: { message }
 
-Rules:
-- Return ONLY a valid JSON array.
+CRITICAL RULES:
+- Return ONLY a valid JSON array. No text outside JSON.
 - Use memory for all credentials and personal data (logins, addresses, cards).
-- Always end your action list with done or error.
-- Take a screenshot after each major step.
+- STOP as soon as the user's goal is visibly achieved - do not keep clicking.
+- If a search result page is shown and the task was "search for X", you are DONE.
+- If a page loads showing the requested content, you are DONE - call done immediately.
+- Do NOT invent extra steps. Do NOT click buttons unrelated to the task.
+- Take a screenshot right before calling done so the user can see the result.
 - Wait 1500ms after every navigation.
 - Prefer text-based click selectors. Use CSS selectors as fallback.
+- If a click fails once, try an alternative selector or skip it - do not retry the same.
+- End every plan with done or error. Never leave a plan open-ended.
 """
 
 async def get_page_info(page: Page) -> dict:
@@ -212,7 +217,7 @@ async def get_page_info(page: Page) -> dict:
             return JSON.stringify(out.slice(0,80), null, 2);
         }""")
         return {"url": url, "title": title, "text": text, "html_snippet": html}
-    except Exception:
+    except:
         return {"url": "unknown", "title": "unknown", "text": "", "html_snippet": ""}
 
 
@@ -255,55 +260,82 @@ def call_llm(model: str, task: str, memory: dict, page_info: dict,
 # ── Main runner ────────────────────────────────────────────────────────────────
 async def run_task(task: str, model: str = "llama3.2",
                    headless: bool = False, emit_fn=None) -> dict:
-    memory   = load_memory()
-    history  = []
-    results  = []
-    MAX_ROUNDS = 12
+    def _emit(event, payload):
+        if emit_fn:
+            emit_fn(event, payload)
+
+    _emit("log", {"msg": f"Task started: {task}", "ts": datetime.now().strftime("%H:%M:%S")})
+    memory  = load_memory()
+    history = []
+    start   = time.time()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=headless,
-            args=["--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-blink-features=AutomationControlled"]
-        )
-        ctx  = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
+        browser = await pw.chromium.launch(headless=headless)
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             )
         )
-        page = await ctx.new_page()
-        if emit_fn:
-            emit_fn("log", {"msg": "Browser launched (Chromium)",
-                            "ts": datetime.now().strftime("%H:%M:%S")})
+        page = await context.new_page()
+        _emit("log", {"msg": "Browser launched (Chromium)", "ts": datetime.now().strftime("%H:%M:%S")})
 
-        for rnd in range(MAX_ROUNDS):
+        final_result = "Task incomplete"
+        done = False
+
+        for round_num in range(12):
+            if done:
+                break
+
             page_info = await get_page_info(page)
-            actions   = call_llm(model, task, memory, page_info, history, emit_fn)
+            actions   = call_llm(model, task, memory, page_info, history, emit_fn=lambda e,p: _emit(e,p))
 
             round_results = []
-            done = False
             for action in actions:
-                result = await execute_action(page, action, emit_fn)
-                round_results.append({"action": action, "result": result})
-                results.append(result)
-                if result.startswith("DONE:") or result.startswith("ERROR:"):
+                result = await execute_action(page, action, emit_fn=lambda e,p: _emit(e,p))
+                round_results.append(result)
+
+                if result.startswith("DONE:"):
+                    final_result = result[5:].strip()
+                    done = True
+                    break
+                if result.startswith("ERROR:") and action.get("action") == "error":
+                    final_result = result
                     done = True
                     break
 
             history.append({"role": "assistant", "content": json.dumps(actions)})
-            history.append({"role": "user",
-                            "content": f"Action results: {json.dumps(round_results)}"})
-            if done:
-                break
+            history.append({"role": "user",      "content": "Results: " + " | ".join(round_results)})
 
-        final_ss = str(LOGS_DIR / f"final_{int(time.time())}.png")
+        # Final screenshot
         try:
-            await page.screenshot(path=final_ss, full_page=False)
-        except Exception:
-            final_ss = None
+            ss_path = str(LOGS_DIR / f"final_{int(time.time())}.png")
+            await page.screenshot(path=ss_path)
+            _emit("log", {"msg": f"Final screenshot: {Path(ss_path).name}",
+                          "ts": datetime.now().strftime("%H:%M:%S")})
+        except:
+            ss_path = ""
+
+        elapsed = round(time.time() - start, 1)
+        _emit("log", {"msg": f"Task complete in {elapsed}s",
+                      "ts": datetime.now().strftime("%H:%M:%S")})
+
+        # Surface any errors logged
+        errors = []
+        ef = LOGS_DIR / "errors.log"
+        if ef.exists():
+            lines = ef.read_text().splitlines()
+            errors = [l for l in lines[-20:] if l.strip()]
+            for e in errors:
+                _emit("log", {"msg": e, "ts": datetime.now().strftime("%H:%M:%S")})
+
         await browser.close()
 
-    return {"results": results, "screenshot": final_ss}
+        return {
+            "result":     final_result,
+            "elapsed":    elapsed,
+            "screenshot": Path(ss_path).name if ss_path else "",
+            "errors":     errors,
+        }

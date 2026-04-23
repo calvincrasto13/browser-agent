@@ -1,75 +1,157 @@
 # BrowserAgent
 
-A local AI browser automation agent. Uses a locally running Ollama LLM to control a Chromium browser via natural language instructions.
+Local AI browser automation agent — uses **Ollama** (local LLM) to control a Chromium tab via natural language instructions.
 
-## Requirements
+---
 
-- Python 3.10+
-- [Ollama](https://ollama.com) running locally (`ollama serve`)
-- At least one LLM pulled: `ollama pull llama3.2`
+## Setup
 
-## Setup (run once)
+### 1. Install Ollama
 
+Download and install Ollama from [https://ollama.com/download](https://ollama.com/download).
+
+- **Windows/Mac**: Run the installer — Ollama starts automatically in the background.
+- **Linux**: Run `curl -fsSL https://ollama.com/install.sh | sh` then start it with `ollama serve`.
+
+Verify it is running:
 ```bash
-cd browser-agent
-python setup.py        # installs pip packages + Chromium
-python app.py          # starts the server
-# Open http://localhost:5000
+ollama list
 ```
 
-## How it works
+---
 
-1. You type a task in the UI (e.g. "Go to Walmart and reorder my last grocery order")
-2. The app sends the task + your stored memory (credentials, preferences) to Ollama
-3. Ollama returns a JSON plan of browser actions
-4. Playwright executes each action on a real Chromium browser window
-5. The agent re-plans after each round using the live page state
-6. All actions and errors are logged in `logs/`
+### 2. Pull a Model
 
-## Memory
+BrowserAgent works best with instruction-following models. Pull one before running the app:
 
-Store credentials and personal info in the **Memory** panel in the UI, or directly in `memory/user_memory.json`.
+```bash
+ollama pull llama3.2
+```
 
-**Example:**
+Other recommended options:
+
+| Model | Pull Command | Notes |
+|---|---|---|
+| **llama3.2** (default) | `ollama pull llama3.2` | Best speed/quality balance |
+| **llama3.1** | `ollama pull llama3.1` | Better for complex multi-step tasks |
+| **mistral** | `ollama pull mistral` | Reliable JSON output |
+| **qwen2.5** | `ollama pull qwen2.5` | Strong structured output |
+
+Verify your model downloaded:
+```bash
+ollama list
+```
+
+---
+
+### 3. Install Python Dependencies & Chromium
+
+```bash
+python setup.py
+```
+
+This installs all pip packages and downloads the Playwright Chromium browser automatically.
+
+---
+
+### 4. Run the App
+
+```bash
+python app.py
+```
+
+Then open **http://localhost:5000** in your browser.
+
+---
+
+## Storing Login Credentials
+
+BrowserAgent uses the Memory system to securely store your usernames, passwords, and other personal info — all saved locally on your PC in `memory/user_memory.json`. The LLM reads these values automatically when it needs to log in to a site.
+
+### How to Add Credentials via the UI
+
+1. Open **http://localhost:5000**
+2. In the left sidebar, go to the **Memory** tab
+3. Fill in the **Key** and **Value** fields and click **+ Add**
+
+Use a consistent naming pattern so the LLM can recognize them:
+
+| Key | Value (your actual value) |
+|---|---|
+| `walmart_email` | `you@email.com` |
+| `walmart_password` | `yourpassword123` |
+| `amazon_email` | `you@email.com` |
+| `amazon_password` | `yourpassword123` |
+| `gmail_email` | `you@gmail.com` |
+| `gmail_password` | `yourpassword` |
+| `full_name` | `Jane Smith` |
+| `delivery_address` | `123 Main St, Mississauga, ON L5B 2C9` |
+| `phone_number` | `647-555-0123` |
+
+> **Tip:** Name keys as `<sitename>_email` and `<sitename>_password`. The LLM will match them to the right site automatically when you give it a task.
+
+---
+
+### How to Add Credentials Directly (JSON file)
+
+You can also edit `memory/user_memory.json` directly in any text editor:
+
 ```json
 {
-  "walmart_email":    "you@email.com",
-  "walmart_password": "yourpassword",
-  "delivery_address": "123 Main St, Mississauga, ON",
-  "full_name":        "Your Name"
+  "walmart_email":       "you@email.com",
+  "walmart_password":    "yourpassword",
+  "amazon_email":        "you@email.com",
+  "amazon_password":     "yourpassword",
+  "netflix_email":       "you@email.com",
+  "netflix_password":    "yourpassword",
+  "full_name":           "Jane Smith",
+  "delivery_address":    "123 Main St, Mississauga, ON L5B 2C9",
+  "phone_number":        "647-555-0123"
 }
 ```
 
-> Sensitive keys (password, pin, card, etc.) are blurred in the UI — hover to reveal.
+Save the file — changes take effect on the next task run (no restart needed).
 
-## Logs
+---
 
-- `logs/agent.log`  — all actions
-- `logs/errors.log` — errors only
-- `logs/*.png`      — screenshots taken during tasks
+### Security Notes
 
-## Supported Actions
+- All credentials stay **100% local** — they are never sent anywhere except to your local Ollama instance running on the same machine.
+- In the UI, any key containing `password`, `pin`, `card`, `cvv`, `secret`, or `token` is **blurred** — hover over it to reveal the value.
+- Do **not** commit `memory/user_memory.json` to Git or share it. Add it to `.gitignore`:
+  ```
+  memory/user_memory.json
+  logs/
+  ```
 
-| Action | Description |
-|---|---|
-| navigate | Go to a URL |
-| click | Click a button or link |
-| fill | Fill an input field |
-| type | Type text character by character |
-| press | Press a key (Enter, Tab, Escape) |
-| scroll | Scroll the page |
-| wait | Pause for N milliseconds |
-| screenshot | Take a screenshot |
-| get_text | Read text from an element |
-| select_option | Choose a dropdown option |
-| done | Mark task complete |
-| error | Log an error and stop |
+---
 
-## Recommended Models
+### Example Tasks Using Stored Credentials
 
-| Model | Command | Notes |
-|---|---|---|
-| llama3.2 | `ollama pull llama3.2` | Best overall, fast |
-| llama3.1 | `ollama pull llama3.1` | Larger, more capable |
-| mistral | `ollama pull mistral` | Good JSON reliability |
-| qwen2.5 | `ollama pull qwen2.5` | Strong structured output |
+Once your credentials are in memory, you can give natural language tasks like:
+
+```
+Log into my Walmart account and reorder my last grocery order
+```
+
+```
+Sign into Amazon and check my recent orders
+```
+
+```
+Go to Netflix and resume the show I was watching
+```
+
+The agent will automatically look up your stored email and password for that site, fill in the login form, and proceed with the task.
+
+---
+
+### Two-Factor Authentication (2FA)
+
+If a site uses 2FA (a code sent to your phone or email), the agent will **pause at that step** — it cannot receive the code automatically. When this happens:
+
+1. Watch the browser window that opens on your screen
+2. Manually type the 2FA code into the browser when prompted
+3. The agent will detect the page has moved on and continue automatically
+
+For sites you use frequently with 2FA, consider using an **app password** (Gmail, Outlook) or disabling 2FA on a trusted device to allow unattended automation.
